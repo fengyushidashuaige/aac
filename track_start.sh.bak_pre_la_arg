@@ -1,0 +1,33 @@
+#!/bin/bash
+# 循环跟踪节点启动 (走 mavros, 不占串口)
+# 用法: bash ~/guttermap/track_start.sh [path.csv] [速度 m/s]
+B=/home/amov/guttermap
+source /opt/ros/melodic/setup.bash
+source /home/amov/fastlio_ws/devel/setup.bash
+export ROS_MASTER_URI=http://192.168.144.60:11311
+
+PATH_CSV=${1:-$B/path.csv}
+V=${2:-0.15}
+CAM=${3:-true}      # 第3个参数: 相机修正开关
+if [ ! -f "$PATH_CSV" ]; then
+  echo "!! 路径文件不存在: $PATH_CSV"
+  echo "   先用 path_build.py / build_polyline.py 生成, 或指定: bash track_start.sh <path.csv>"
+  exit 1
+fi
+if ! (timeout 3 rostopic list >/dev/null 2>&1); then
+  echo "!! ROS master 不通, 先跑 ~/p600_fastlio/start.sh"; exit 1
+fi
+if [ -f $B/run/track.pid ] && kill -0 $(cat $B/run/track.pid) 2>/dev/null; then
+  echo "[track] 已在跑 pid=$(cat $B/run/track.pid), 先 track_stop.sh"; exit 1
+fi
+echo "[track] 路径: $PATH_CSV   速度: ${V} m/s"
+setsid nohup python2 -u $B/gutter_track.py _path:="$PATH_CSV" _v_cruise:=$V _use_cam:=$CAM \
+  > $B/run/track.log 2>&1 < /dev/null &
+echo $! > $B/run/track.pid
+sleep 4
+echo "[track] pid=$(cat $B/run/track.pid)   日志 $B/run/track.log"
+echo
+echo "  ① 先看状态(未使能, 发零速):  tail -f $B/run/track.log"
+echo "  ② 飞控切 OFFBOARD 后使能:    rosservice call /gutter_track/set_enable true"
+echo "  ③ 急停(悬停):               rosservice call /gutter_track/set_enable false"
+echo "  ④ 停节点:                   bash ~/guttermap/track_stop.sh"

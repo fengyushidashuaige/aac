@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""折线加载 + 纯追踪 (Pure Pursuit)。纯数学, 无依赖。
+   坐标系: 机体 x前 y左 z上 ; yaw 逆时针为正 ; 指令 vx/vy/yaw_rate"""
+import math
+
+def _d(ax, ay, bx, by):
+    return math.hypot(bx - ax, by - ay)
+
+class Polyline(object):
+    def __init__(self, pts):
+        if not pts or len(pts) < 2:
+            raise ValueError('need >=2 points')
+        self.pts = [(float(p[0]), float(p[1])) for p in pts]
+        self.s = [0.0]
+        for i in range(1, len(self.pts)):
+            self.s.append(self.s[-1] + _d(self.pts[i-1][0], self.pts[i-1][1],
+                                          self.pts[i][0], self.pts[i][1]))
+        self.length = self.s[-1]
+
+    def smooth(self, win=5, passes=2):
+        p = list(self.pts); n = len(p)
+        for _ in range(passes):
+            q = list(p)
+            for i in range(n):
+                a = max(0, i - win // 2); b = min(n, i + win // 2 + 1)
+                q[i] = (sum(p[j][0] for j in range(a, b)) / (b - a),
+                        sum(p[j][1] for j in range(a, b)) / (b - a))
+            p = q
+        return Polyline(p)
+
+    def project(self, x, y):
+        """-> (弧长 s, 横向偏差 cte[左正], 切向角)"""
+        best = (1e18, 0.0, 0.0, 0.0)
+        for i in range(len(self.pts) - 1):
+            ax, ay = self.pts[i]; bx, by = self.pts[i+1]
+            dx, dy = bx - ax, by - ay
+            seg2 = dx*dx + dy*dy
+            t = 0.0 if seg2 < 1e-12 else min(1.0, max(0.0, ((x-ax)*dx + (y-ay)*dy) / seg2))
+            px, py = ax + t*dx, ay + t*dy
+            d = _d(x, y, px, py)
+            if d < best[0]:
+                side = 1.0 if (dx*(y-ay) - dy*(x-ax)) > 0 else -1.0
+                best = (d, self.s[i] + t*math.sqrt(seg2), math.atan2(dy, dx), side*d)
+        return best[1], best[3], best[2]
+
+    def point_at(self, s):
+        if s <= 0: return self.pts[0]
+        if s >= self.length: return self.pts[-1]
+        lo, hi = 0, len(self.s) - 1
+        while lo < hi - 1:
+            mid = (lo + hi) // 2
+            if self.s[mid] <= s: lo = mid
+            else: hi = mid
+        seg = self.s[hi] - self.s[lo]
+        t = 0.0 if seg < 1e-9 else (s - self.s[lo]) / seg
+        ax, ay = self.pts[lo]; bx, by = self.pts[hi]
+        return (ax + t*(bx - ax), ay + t*(by - ay))
+
+class Command(object):
+    def __init__(self):
+        self.vx = self.vy = self.yaw_rate = 0.0
+        self.s = self.cte = self.heading_err = 0.0
+        self.lookahead = (0.0, 0.0)
+        self.finished = False
+        self.active = False
+        self.note = ''
+    def __repr__(self):
+        return ('vx=%+.3f vy=%+.3f yaw=%+.3f cte=%+.3f herr=%.1fdeg %s'
+                % (self.vx, self.vy, self.yaw_rate, self.cte,
+                   math.degrees(self.heading_err), self.note))
+
+class PurePursuit(object):
+    def __init__(self, polyline, v_cruise=0.3, lookahead=0.8, slow_radius=1.0,
+                 max_yaw_rate=0.4, max_vy=0.15, cte_gain=0.5):
+        self.pl = polyline; self.v_cruise = v_cruise; self.lookahead = lookahead
+        self.slow_radius = slow_radius; self.max_yaw_rate = max_yaw_rate
+        self.max_vy = max_vy; self.cte_gain = cte_gain
+
+    def update(self, x, y, yaw, v_now=0.0):
+        c = Command()
+        s, cte, _ = self.pl.project(x, y)
+        c.s, c.cte = s, cte
+        remain = self.pl.length - s
+        if remain < 0.15:
+            c.finished = True; c.note = 'PATH_END'
+            if abs(v_now) < 0.05: return c
+        L = min(self.lookahead, max(0.25, remain * 0.8))
+        tx, ty = self.pl.point_at(s + L); c.lookahead = (tx, ty)
+        dx, dy = tx - x, ty - y
+        cs, sn = math.cos(yaw), math.sin(yaw)
+        fx = dx*cs + dy*sn; fy = -dx*sn + dy*cs
+        Ld = math.hypot(dx, dy)
+        if Ld < 1e-6:
+            c.note = 'AT_TARGET'; return c
+        alpha = math.atan2(fy, fx); c.heading_err = alpha
+        c.yaw_rate = 2.0 * max(self.v_cruise, 0.15) * math.sin(alpha) / Ld
+        c.yaw_rate = max(-self.max_yaw_rate, min(self.max_yaw_rate, c.yaw_rate))
+        c.vy = max(-self.max_vy, min(self.max_vy, -self.cte_gain * cte))
+        if remain < self.slow_radius:
+            c.vx = self.v_cruise * max(0.15, remain / self.slow_radius)
+        else:
+            c.vx = self.v_cruise
+        if abs(alpha) > math.radians(45): c.vx *= 0.35
+        elif abs(alpha) > math.radians(25): c.vx *= 0.6
+        c.active = True
+        return c

@@ -1,0 +1,132 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+"""
+视觉伺服循迹节点 (半自动) —— 跟着画面中心偏差飞
+
+人负责: 起飞 / 高度 / 降落 / 应急接管
+系统负责: 横向对齐 + 航向对齐 (让水槽保持在画面中心)
+
+★ 不占串口: 只发 ROS 话题 -> mavros -> 飞控
+★ 不需要路径, 不需要世界系对齐 (偏差是相对机体的)
+"""
+import math, socket, json, time, threading
+import rospy
+from geometry_msgs.msg import TwistStamped
+from std_srvs.srv import SetBool, SetBoolResponse
+
+UDP_PORT = 45679
+
+KP_OFF    = 0.0008      # 每 mm 偏移 -> m/s 横移
+KP_ANG    = 0.012       # 每度角   -> rad/s 偏航
+MAX_VY    = 0.10
+MAX_YAW   = 0.12
+CRUISE    = 0.05
+MIN_CONF  = 0.50     # 2026-09-20: 0.7 -> 0.50
+                     # 依据 20260920_151629 实测飞行数据(3100帧):
+                     #   conf 中位 0.51; 而且【槽越接近画面中心, conf 越低】——
+                     #   中心附近(|off|<20mm) 中位 0.50, 偏 100~500mm 反而 0.68~0.72。
+                     #   门限 0.7 会在"快对准"时把帧全拒掉, 形成
+                     #   接近→conf掉→被拒→漂开→conf升→再修 的振荡 => 锁不住。
+                     #   取 0.50 这个天然分界: 放过中心帧(0.50), 仍挡住误检(0.35)。
+                     #   !! 不要低于 0.50, 否则会把 0.35 那档误检一起放进来。
+DEAD_MM   = 12.0        # 实测噪声 sigma~5mm, 取 ~2sigma (v1 用 30 太大了)
+DEAD_DEG  = 1.5
+SLEW_VY   = 0.25
+SLEW_YAW  = 0.30
+
+
+class Servo(object):
+    def __init__(self):
+        self.rate_hz = rospy.get_param('~rate', 20.0)
+        self.enable = False
+        self.off = self.ang = self.conf = 0.0
+        self.detected = False; self.held = False; self.t_pkt = 0.0
+        self.vy_cmd = self.yaw_cmd = 0.0
+        self.last_t = time.time(); self.last_print = 0.0
+
+        self.pub = rospy.Publisher('/mavros/setpoint_velocity/cmd_vel',
+                                   TwistStamped, queue_size=1)
+        rospy.Service('~set_enable', SetBool, self.on_enable)
+        threading.Thread(target=self.udp_loop).start()
+        rospy.Timer(rospy.Duration(1.0 / self.rate_hz), self.control)
+
+    def on_enable(self, req):
+        self.enable = bool(req.data)
+        rospy.logwarn('[servo] enable = %s' % self.enable)
+        return SetBoolResponse(success=True, message='enable=%s' % self.enable)
+
+    def udp_loop(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.bind(('127.0.0.1', UDP_PORT)); s.settimeout(1.0)
+        except Exception as e:
+            rospy.logerr('[servo] UDP %d 绑定失败: %s' % (UDP_PORT, e)); return
+        while not rospy.is_shutdown():
+            try:
+                d, _ = s.recvfrom(1024)
+                j = json.loads(d.decode('utf-8'))
+                self.off = float(j.get('offset_mm', 0.0))
+                self.ang = float(j.get('angle_deg', 0.0))
+                self.conf = float(j.get('conf', 0.0))
+                self.detected = bool(j.get('detected', False))
+                self.held = bool(j.get('held', False))
+                self.t_pkt = time.time()
+            except socket.timeout:
+                pass
+            except Exception:
+                pass
+
+    @staticmethod
+    def _slew(cur, tgt, rate, dt):
+        d = tgt - cur; m = rate * dt
+        return cur + max(-m, min(m, d))
+
+    def publish(self, vx, vy, yaw):
+        t = TwistStamped()
+        t.header.stamp = rospy.Time.now(); t.header.frame_id = 'base_link'
+        t.twist.linear.x = vx; t.twist.linear.y = vy; t.twist.angular.z = yaw
+        self.pub.publish(t)
+
+    def control(self, ev):
+        now = time.time(); dt = max(now - self.last_t, 1e-3); self.last_t = now
+
+        if not self.enable:                       # 没使能 -> 零速, 但保持发流
+            self.vy_cmd = self.yaw_cmd = 0.0
+            self.publish(0.0, 0.0, 0.0)
+            return
+
+        fresh = (now - self.t_pkt) < 0.5
+        valid = fresh and self.detected and (not self.held) and self.conf >= MIN_CONF
+
+        if not valid:                             # 丢检 -> 衰减到停
+            self.vy_cmd  = self._slew(self.vy_cmd,  0.0, SLEW_VY * 2, dt)
+            self.yaw_cmd = self._slew(self.yaw_cmd, 0.0, SLEW_YAW * 2, dt)
+            self.publish(0.0, self.vy_cmd, self.yaw_cmd)
+            rospy.logwarn_throttle(2.0, '[servo] 丢检 conf=%.2f held=%s fresh=%s'
+                                   % (self.conf, self.held, fresh))
+            return
+
+        off, ang = self.off, self.ang
+        vy_t  = 0.0 if abs(off) <= DEAD_MM  else KP_OFF * off
+        yaw_t = 0.0 if abs(ang) <= DEAD_DEG else -KP_ANG * ang
+        vy_t  = max(-MAX_VY,  min(MAX_VY,  vy_t))
+        yaw_t = max(-MAX_YAW, min(MAX_YAW, yaw_t))
+
+        self.vy_cmd  = self._slew(self.vy_cmd,  vy_t,  SLEW_VY,  dt)
+        self.yaw_cmd = self._slew(self.yaw_cmd, yaw_t, SLEW_YAW, dt)
+
+        a = min(1.0, abs(off) / 150.0); b = min(1.0, abs(ang) / 20.0)
+        vx = CRUISE * max(0.25, 1.0 - max(a, b))
+        self.publish(vx, self.vy_cmd, self.yaw_cmd)
+
+        if now - self.last_print > 1.0:
+            self.last_print = now
+            rospy.loginfo('[servo] off=%+7.1fmm ang=%+6.1f conf=%.2f  vx=%.3f vy=%+.3f yaw=%+.3f'
+                          % (off, ang, self.conf, vx, self.vy_cmd, self.yaw_cmd))
+
+
+if __name__ == '__main__':
+    rospy.init_node('servo_track')
+    rospy.logwarn('=== servo_track 视觉伺服启动 (走 mavros, 不占串口) ===')
+    Servo()
+    rospy.spin()

@@ -1,0 +1,125 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>水槽检测 · 校正对比 · 地图</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#14161a;color:#e6e8ea;font:13px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+     display:flex;flex-direction:column;height:100vh}
+header{padding:8px 14px;background:#1c1f24;border-bottom:1px solid #2c3138;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+h1{font-size:14px;margin:0;font-weight:600}
+#conf{padding:3px 10px;border-radius:4px;font-weight:700;font-variant-numeric:tabular-nums}
+.g{background:#1f4d2b;color:#7ee2a0}.o{background:#4d3a1f;color:#f0b866}.r{background:#4d1f1f;color:#ff8a8a}
+#ctl{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-left:auto;font-size:12px}
+#ctl label{color:#8b929b}
+#ctl input{width:58px;background:#262a30;border:1px solid #3a4149;color:#e6e8ea;border-radius:4px;padding:3px 6px;
+           font-variant-numeric:tabular-nums}
+#ctl button{background:#2b3138;border:1px solid #3a4149;color:#e6e8ea;border-radius:4px;padding:4px 10px;cursor:pointer}
+#ctl button:hover{background:#343b44}
+#ctl button.on{background:#1f4d2b;border-color:#2f7a45;color:#7ee2a0}
+#monbar{padding:6px 14px;font-size:13px;display:flex;gap:18px;align-items:center;
+        flex-wrap:wrap;border-bottom:1px solid #2c3138;font-variant-numeric:tabular-nums}
+#monbar.ok  {background:#16301f;color:#7ee2a0}
+#monbar.warn{background:#3d3316;color:#f5d76e}
+#monbar.alarm{background:#4d1a1a;color:#ff8a8a;font-weight:700}
+#monbar.none{background:#26292e;color:#9aa3ad}
+#monbar .lbl{opacity:.65;font-weight:400}
+main{flex:1;display:flex;gap:10px;padding:10px;min-height:0}
+.pane{flex:1;display:flex;flex-direction:column;min-width:0}
+.pane h2{font-size:12px;margin:0 0 5px;color:#8b929b;font-weight:600;display:flex;justify-content:space-between}
+.pane .box{flex:1;display:flex;align-items:center;justify-content:center;background:#000;border-radius:6px;overflow:hidden;min-height:0}
+.pane img{max-width:100%;max-height:100%}
+footer{padding:7px 14px;background:#1c1f24;border-top:1px solid #2c3138;font-size:12px;color:#8b929b;
+       display:flex;gap:18px;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+b{color:#e6e8ea;font-weight:600}
+</style></head><body>
+<header>
+  <h1>水槽检测</h1>
+  <span id="conf">—</span>
+  <div id="ctl">
+    <button id="m_off">关闭校正</button>
+    <button id="m_gray">灰世界(自动)</button>
+    <button id="m_man">手动</button>
+    <label>R</label><input id="gr" type="number" step="0.05" min="0.2" max="4" value="1">
+    <label>G</label><input id="gg" type="number" step="0.05" min="0.2" max="4" value="1">
+    <label>B</label><input id="gb" type="number" step="0.05" min="0.2" max="4" value="1">
+    <button id="apply">应用</button>
+  </div>
+</header>
+<div id="monbar" class="none"><span class="lbl">源监控</span><span id="mon">等待数据…</span></div>
+<main>
+  <div class="pane">
+    <h2><span>① 检测画面（喂给模型 + 中心线）</span><span id="stat_cor"></span></h2>
+    <div class="box"><img src="/video_feed"></div>
+  </div>
+  <div class="pane" style="flex:0 0 34%">
+    <h2><span>② 地图（俯视 · 1米格）</span><span id="stat_map"></span></h2>
+    <div class="box"><img id="mp" alt="等待建图数据…"></div>
+  </div>
+</main>
+<footer>
+  <span>offset <b id="off">—</b>mm</span>
+  <span>angle <b id="ang">—</b>°</span>
+  <span>fps <b id="fps">—</b></span>
+  <span>conf 模式 <b id="mode">—</b></span>
+  <span id="st" style="margin-left:auto">连接中…</span>
+</footer>
+<script>
+const $=id=>document.getElementById(id);
+const MODES=['off','gray','man'];
+function paint(m){ MODES.forEach(x=>$('m_'+x).className = (x===m?'on':'')); }
+document.getElementById('m_off').onclick =()=>set('off');
+document.getElementById('m_gray').onclick=()=>set('gray');
+document.getElementById('m_man').onclick =()=>set('man');
+$('apply').onclick=()=>set('man');
+function set(mode){
+  const q='mode='+mode+'&r='+$('gr').value+'&g='+$('gg').value+'&b='+$('gb').value;
+  fetch('/api/corr?'+q).then(r=>r.json()).then(d=>{paint(d.mode); show(d);}).catch(()=>{});
+}
+function show(d){
+  $('mode').textContent = d.mode==='off'?'关闭':(d.mode==='gray'?'灰世界':'手动');
+  if(d.mode==='man'){ $('gr').value=d.r; $('gg').value=d.g; $('gb').value=d.b; }
+}
+let miss=0;
+async function poll(){
+  try{
+    const d=await (await fetch('/api/telemetry',{cache:'no-store'})).json();
+    miss=0;
+    // ★ 2026-09-18: 没检测到(det=false)时不显示残值。
+    //   原来不管检没检测到都显示 offset/angle, 于是画面写着 "SEG no mask"、
+    //   底部却还挂着 1228.6mm / -68.0° 这种上一帧/残留的数, 自相矛盾。
+    $('off').textContent = d.det ? d.off.toFixed(1) : '—';
+    $('ang').textContent = d.det ? d.ang.toFixed(1) : '—';
+    $('fps').textContent=d.fps.toFixed(1);
+    show(d.corr||{}); paint((d.corr||{}).mode);
+    const c=d.conf, e=$('conf');
+    e.textContent = d.det ? ('conf '+c.toFixed(2)) : '未检测';
+    e.className = (d.det && c>=0.7) ? 'g' : ((d.det && c>=0.3) ? 'o' : 'r');
+    $('st').textContent='● '+new Date().toLocaleTimeString();
+    $('stat_cor').textContent='B'+d.cb_b+' G'+d.cb_g+' R'+d.cb_r+' 品红'+d.cmag;
+  }catch(e){
+    miss++; e=$('conf'); e.textContent='conf —'; e.className='r';
+    $('st').textContent='✕ 数据断开 '+miss;
+  }
+}
+async function pollMon(){
+  const el=document.getElementById('monbar'), tx=document.getElementById('mon');
+  try{
+    const d=await (await fetch('/api/monitor',{cache:'no-store'})).json();
+    if(!d || d.t===undefined){ el.className='none'; tx.textContent='监控节点没在跑'; return; }
+    const age=Date.now()/1000 - d.t;
+    if(age>3){ el.className='none'; tx.textContent='监控数据过期 '+age.toFixed(0)+'s'; return; }
+    const parts=[];
+    parts.push('GPS '+(d.gps_ok? (d.sats+'星 fix'+d.fix+' ✓') : '✗无数据'));
+    parts.push('视觉 '+(d.vis_ok? (d.vis_hz.toFixed(1)+'Hz ✓') : '✗无数据'));
+    let cls='ok';
+    if(d.diff===null||d.diff===undefined){ parts.push('分歧 —'); cls = (d.gps_ok&&d.vis_ok)?'ok':'warn'; }
+    else if(d.diff>=3.0){ parts.push('分歧 '+d.diff.toFixed(2)+'m ✗✗ 建议停飞'); cls='alarm'; }
+    else if(d.diff>=1.0){ parts.push('分歧 '+d.diff.toFixed(2)+'m ⚠'); cls='warn'; }
+    else { parts.push('分歧 '+d.diff.toFixed(2)+'m ✓'); cls='ok'; }
+    if(!d.gps_ok && !d.vis_ok){ cls='alarm'; parts.push('两个源都死!'); }
+    el.className=cls; tx.textContent=parts.join('   ');
+  }catch(e){ el.className='none'; tx.textContent='监控读取失败'; }
+}
+pollMon(); setInterval(pollMon, 800);
+setInterval(()=>{ document.getElementById('mp').src='/map.jpg?t='+Date.now(); }, 1200);
+poll(); setInterval(poll,400);
+</script></body></html>

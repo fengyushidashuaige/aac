@@ -1,0 +1,212 @@
+#!/usr/bin/env python2
+# -*- coding: utf-8 -*-
+"""
+循迹控制节点 (框架) —— 沿 path.csv 自动飞
+
+★ 串口问题: 【不直接开串口】, 全部走 mavros
+    mavros 已经占着 /dev/ttyTHS1 并往飞控发 vision_pose
+    本节点只发 ROS 话题 -> mavros -> 串口 -> 飞控
+    所以可以和雷达定位【同时运行】
+
+指令:  /mavros/setpoint_velocity/cmd_vel  (TwistStamped, 机体系速度+yaw速率)
+
+安全:  只有 enable=True 且飞控 armed 才发指令, 否则发零速
+    bash: rosservice call /gutter_track/set_enable true
+"""
+import math, socket, json, csv, threading, time
+import rospy
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import TwistStamped
+from std_srvs.srv import SetBool, SetBoolResponse
+
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pursuit import Polyline, PurePursuit
+
+UDP_PORT = 45679          # 相机偏移 (gutter_udp 在发)
+
+
+def load_path(path):
+    pts = []
+    with open(path) as f:
+        for i, ln in enumerate(f):
+            if i == 0 and not (ln[0].isdigit() or ln[0] == '-'):
+                continue
+            p = ln.strip().split(',')
+            if len(p) >= 2:
+                try:
+                    pts.append((float(p[0]), float(p[1])))
+                except ValueError:
+                    pass
+    return pts
+
+
+class Tracker(object):
+    def __init__(self):
+        path_file = rospy.get_param('~path', '')
+        self.v_cruise = rospy.get_param('~v_cruise', 0.3)
+        self.lookahead = rospy.get_param('~lookahead', 0.8)
+        self.rate_hz = rospy.get_param('~rate', 20.0)
+        self.use_cam = rospy.get_param('~use_cam', False)   # 阶段2 打开
+
+        pts = load_path(path_file)
+        rospy.loginfo('[track] 载入路径 %s: %d 点' % (path_file, len(pts)))
+        self.pl = Polyline(pts).smooth(win=5, passes=2)
+        self.pp = PurePursuit(self.pl, v_cruise=self.v_cruise,
+                              lookahead=self.lookahead, slow_radius=1.0,
+                              max_yaw_rate=0.4, max_vy=0.15, cte_gain=0.5)
+
+        self.pose = None          # (x, y, yaw)
+        self.speed = 0.0
+        self.armed = False
+        self.enable = False
+        self.cam_off = None       # 相机偏移(mm), 阶段2 用
+        self.cam_t = 0.0
+        self.off_lp = 0.0
+        self.cte_lp = None
+        self.lat_shift = 0.0
+        self.wpx_lp = None
+        self.last_print = 0.0
+
+        rospy.Subscriber('/Odometry', Odometry, self.on_odom, queue_size=10)
+        self.pub = rospy.Publisher('/mavros/setpoint_velocity/cmd_vel',
+                                   TwistStamped, queue_size=1)
+        rospy.Service('~set_enable', SetBool, self.on_enable)
+
+        threading.Thread(target=self.udp_loop).start()
+        rospy.Timer(rospy.Duration(1.0 / self.rate_hz), self.control)
+
+    # ---------- 输入 ----------
+    def update_cam_fix(self, c):
+        if not (self.use_cam and self.cam_off is not None):
+            return                        # 无有效数据: 冻结上一值, 不归零
+        TAU = 2.5
+        dt = 1.0 / max(self.rate_hz, 1.0)
+        # 门3: 飞机不在路径附近时不许学(停在一边时看到的槽不能用)
+        if abs(self.cam_off) > 250.0 or abs(c.cte_raw) > 0.40:
+            return
+        a = 1.0 - math.exp(-dt / TAU)
+        self.off_lp += a * (self.cam_off / 1000.0 - self.off_lp)
+        if self.cte_lp is None:
+            self.cte_lp = c.cte_raw
+        else:
+            self.cte_lp += a * (c.cte_raw - self.cte_lp)
+        tgt = self.cte_lp - self.off_lp
+        _d = a * (tgt - self.lat_shift)
+        _cap = 0.10 * dt                  # 变化率限幅 100mm/s
+        self.lat_shift += max(-_cap, min(_cap, _d))
+        self.lat_shift = max(-0.5, min(0.5, self.lat_shift))
+
+    def on_odom(self, m):
+        q = m.pose.pose.orientation; p = m.pose.pose.position
+        x, y, z, w = q.x, q.y, q.z, q.w
+        yaw = math.atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+        self.pose = (p.x, p.y, yaw)
+        v = m.twist.twist.linear
+        self.speed = math.hypot(v.x, v.y)
+
+    def udp_loop(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.bind(('127.0.0.1', UDP_PORT)); s.settimeout(1.0)
+        except Exception as e:
+            rospy.logwarn('[track] UDP %d 绑定失败: %s (可能 gutter_udp 没在跑)' % (UDP_PORT, e))
+            return
+        while not rospy.is_shutdown():
+            try:
+                d, _ = s.recvfrom(1024)
+                j = json.loads(d.decode('utf-8'))
+                ok = (j.get('detected') and not j.get('held')
+                      and j.get('conf', 0) >= 0.6)
+                _off = float(j.get('offset_mm', 0.0) or 0.0)
+                _w = float(j.get('wpx', 0.0) or 0.0)
+                # 门1: 物理上限. mask 被截断时检测器给出 -846/-1252mm 这种
+                #   不可能的值(相机横向视野只有 ±250mm), 而 conf 是模型分主导挡不住.
+                if ok and abs(_off) > 250.0:
+                    ok = False
+                # 门2: wpx 相对滑动参考的带宽(mask 截断会让 wpx 偏小)
+                if ok and _w > 1.0:
+                    self.wpx_lp = _w if self.wpx_lp is None else 0.98 * self.wpx_lp + 0.02 * _w
+                    if not (0.80 * self.wpx_lp <= _w <= 1.25 * self.wpx_lp):
+                        ok = False
+                if ok:
+                    self.cam_off = _off
+                    self.cam_t = time.time()
+                elif time.time() - self.cam_t > 1.0:
+                    self.cam_off = None
+            except socket.timeout:
+                pass
+            except Exception:
+                pass
+
+    def on_enable(self, req):
+        self.enable = bool(req.data)
+        rospy.logwarn('[track] enable = %s' % self.enable)
+        return SetBoolResponse(success=True, message='enable=%s' % self.enable)
+
+    # ---------- 控制 ----------
+    def publish(self, vx, vy, yaw_rate):
+        t = TwistStamped()
+        t.header.stamp = rospy.Time.now()
+        t.header.frame_id = 'base_link'
+        t.twist.linear.x = vx
+        t.twist.linear.y = vy
+        t.twist.angular.z = yaw_rate
+        self.pub.publish(t)
+
+    def control(self, ev):
+        # ★ 无论什么情况都保持发流: PX4 OFFBOARD 要求 >2Hz 的持续设定点,
+        #   断流会被踢出 OFFBOARD。所以没位姿/没使能时发零速, 而不是不发。
+        if self.pose is None:
+            self.publish(0.0, 0.0, 0.0)
+            return
+        x, y, yaw = self.pose
+
+        # 安全门: 没使能 -> 发零速
+        if not self.enable:
+            self.publish(0.0, 0.0, 0.0)
+            # ★ 2026-09-20: 未使能时也把路径投影算一遍并打印。
+            #   原来这里直接 return, 地面检查时看不到 cte/herr,
+            #   没法确认"飞机当前位置和路径对不对得上", 起飞后才发现就晚了。
+            _c = self.pp.update(x, y, yaw, self.speed, lat_shift=self.lat_shift)
+            self.update_cam_fix(_c)
+            now = time.time()
+            if now - self.last_print > 1.0:
+                self.last_print = now
+                rospy.loginfo('[track] (未使能) s=%5.2f/%.2f  cte=%+6.1fmm  '
+                              'herr=%+5.1fdeg  vx=0.00 (锁着)'
+                              % (_c.s, self.pl.length, 1000 * _c.cte,
+                                 math.degrees(_c.heading_err)))
+                rospy.loginfo('[track] (idle) fix=%+.0fmm  cam=%s  off_lp=%+.0fmm'
+                              % (1000 * self.lat_shift,
+                                 ('%+.0f' % self.cam_off) if self.cam_off is not None else '--',
+                                 1000 * self.off_lp))
+            return
+
+        # 阶段2: 相机偏移 -> 把路径临时挪一下 (真正的"局部校正")
+        if self.use_cam and self.cam_off is not None:
+            pass    # TODO(阶段2): 用 cam_off 对当前前视点做横向平移
+
+        c = self.pp.update(x, y, yaw, self.speed, lat_shift=self.lat_shift)
+        self.update_cam_fix(c)
+        if c.finished:
+            rospy.loginfo('[track] 到终点'); self.enable = False
+            self.publish(0.0, 0.0, 0.0)
+            return
+        self.publish(c.vx, c.vy, c.yaw_rate)
+
+        now = time.time()
+        if now - self.last_print > 1.0:
+            self.last_print = now
+            rospy.loginfo('[track] s=%5.2f/%.2f  cte=%+6.1fmm  herr=%+5.1fdeg  '
+                          'vx=%.2f vy=%.2f yaw=%.3f  fix=%+.0fmm cam=%s'
+                          % (c.s, self.pl.length, 1000*c.cte, math.degrees(c.heading_err),
+                             c.vx, c.vy, c.yaw_rate, 1000 * self.lat_shift,
+                             ('%+.0f' % self.cam_off) if self.cam_off is not None else '--'))
+
+
+if __name__ == '__main__':
+    rospy.init_node('gutter_track')
+    rospy.logwarn('=== gutter_track 启动 (走 mavros, 不占串口) ===')
+    Tracker()
+    rospy.spin()

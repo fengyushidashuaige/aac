@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""阶段2-A: 相机+TRT检测 -> UDP输出 + HTTP预览 (python3, 不碰ROS/飞控)"""
+import sys, os, time, json, socket, threading
+sys.path.insert(0, '/home/amov/gutter_uav')
+os.chdir('/home/amov/gutter_uav')
+import cv2
+import subprocess
+import numpy as np
+import urllib.parse
+from config import default_config
+from config_jetson import apply_jetson_px4
+from detector import TroughDetector
+from main import _build_web_preview_lite
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+PORT = 45678          # -> gutter_map (建图)
+PORT_SERVO = 45679    # -> servo_track (伺服)
+STATE = {'jpeg': None, 'off': 0.0, 'ang': 0.0, 'conf': 0.0, 'det': False, 'fps': 0.0,
+         'x0': -1, 'x1': -1, 'y0': -1, 'y1': -1, 'wpx': 0.0, 'held': False,
+         'jpeg_raw': None, 'rb_b': 0, 'rb_g': 0, 'rb_r': 0, 'rmag': 0,
+         'cb_b': 0, 'cb_g': 0, 'cb_r': 0, 'cmag': 0}
+
+# 飞行会话目录 (与项目惯例一致)
+import datetime
+SESSION = os.path.join('/home/amov/logs',
+                       'guttermap_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
+os.makedirs(SESSION, exist_ok=True)
+VIDEO = os.path.join(SESSION, 'overlay.avi')
+RAW_DIR = os.path.join(SESSION, 'raw')          # 训练用: 无叠加原图
+RAW_EVERY = 15                                  # 每 N 帧存一张 (~1s @15fps)
+os.makedirs(RAW_DIR, exist_ok=True)
+print('[rec] 会话目录 %s' % SESSION, flush=True)
+print('[rec] 原图(训练用) -> %s  每 %d 帧一张' % (RAW_DIR, RAW_EVERY), flush=True)
+
+CORR = {'mode': 'off', 'r': 1.0, 'g': 1.0, 'b': 1.0}   # off / gray / man
+                            # ★ 新镜头带 IR-CUT, 画面本来就中性, 不需要软件校正
+CORR_G = [1.0, 1.0, 1.0]        # BGR 平滑后的增益 (灰世界每帧重算会抖, 加时间平滑)
+CORR_ALPHA = 0.12
+
+# ── 自动曝光 ──
+AE = {'on': False, 'target': 105.0, 'gain': 60, 'exp': 128, 'last': 0.0, 'bright': 0.0,
+      # ★ 2026-09-18 关闭周期性 AE: 每2秒一次的 v4l2-ctl 抢设备会打断 UVC 视频流,
+      #   导致亮度在 80/125 间跳变 + 画面撕裂。改由相机自动曝光(exposure_auto=3)负责。
+      'gain_max': 200, 'exp_max': 10000}
+DEV = '/dev/video0'
+
+def v4l2(ctrl, val):
+    try:
+        subprocess.call(['v4l2-ctl', '-d', DEV, '-c', '%s=%s' % (ctrl, val)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def cam_init():
+    """相机基准: 低增益 + 合理曝光起步。
+    ★ 关键: 增益只给 60 (实测 gain=600 时噪声 9.75, gain=60 时 1.08 —— 差 9 倍!)
+      亮度主要靠【曝光时间】补, 不是靠增益。"""
+    v4l2('white_balance_temperature_auto', 1)
+    # ★ 2026-09-18: 原来是 1(手动曝光), 导致必须靠程序 ae_step 去补,
+    #   而 ae_step 每2秒用 v4l2-ctl 抢设备, 反而把视频流打断了(画面明暗闪)。
+    #   改成 0 = 交给相机自动曝光 —— 和 Windows 上同一相机的行为一致。
+    v4l2('exposure_auto', 3)   # 3=Aperture Priority (本驱动 default 值; 0 被相机拒绝)
+    v4l2('gamma', 100)                          # 默认
+    v4l2('brightness', 0)                       # 默认
+    v4l2('gain', 60)                            # ★ 低增益 (高增益=噪点)
+    # v4l2('exposure_absolute', 128)   # ★ 2026-09-18 解除: 自动曝光模式下不手动锁死
+
+def ae_step(bright):
+    """自动曝光 —— ★ 优先调【曝光时间】(干净), 增益只在 0~200 内小幅辅助。
+    实测: gain 600 时噪声 9.75, gain 60 时 1.08。高增益是噪点的根源。"""
+    if not AE['on'] or bright is None:
+        return
+    if bright < 3:                       # 全黑, 大步拉曝光
+        if AE['exp'] < AE['exp_max']:
+            AE['exp'] = min(AE['exp_max'], max(4, AE['exp'] * 3)); v4l2('exposure_absolute', AE['exp'])
+        elif AE['gain'] < AE['gain_max']:
+            AE['gain'] = min(AE['gain_max'], AE['gain'] + 100); v4l2('gain', AE['gain'])
+        return
+    t = AE['target']
+    if t * 0.90 <= bright <= t * 1.10:
+        return                            # 死区
+    ratio = min(max(t / bright, 1.0 / 2.0), 2.0)
+    # ★ 2026-09-18 加阻尼: 实测亮度对曝光的响应约为 2 倍线性
+    #   (exp 190 -> 均值125, exp 158 -> 均值80; 曝光变 17% 亮度变 36%)。
+    #   全量按 ratio 调整必然冲过头, 结果在 80 <-> 125 之间永久震荡,
+    #   永远进不了死区。改为只走一半, 并限幅 ±12% 逐步逼近。
+    ratio = 1.0 + (ratio - 1.0) * 0.5
+    ratio = min(max(ratio, 0.88), 1.12)
+    if bright < t:                        # 太暗 -> 先加曝光
+        if AE['exp'] < AE['exp_max']:
+            n = int(round(AE['exp'] * ratio))
+            if n <= AE['exp']: n = AE['exp'] + 1
+            AE['exp'] = min(AE['exp_max'], n); v4l2('exposure_absolute', AE['exp'])
+        elif AE['gain'] < AE['gain_max']:
+            n = int(round(AE['gain'] * ratio))
+            if n <= AE['gain']: n = AE['gain'] + 1
+            AE['gain'] = min(AE['gain_max'], n); v4l2('gain', AE['gain'])
+    else:                                 # 太亮 -> 先降曝光
+        if AE['exp'] > 1:
+            # ★ 2026-09-18 修复: 原为 AE['exp'] / ratio。
+            #   ratio = t/bright, 偏亮时 <1, 除以它等于【放大曝光】—— 方向反了!
+            #   只靠下一行 n>=exp -> exp-1 兜底, 变成每 2 秒才降 1 档,
+            #   画面偏亮时根本压不下来(实测灰度均值 125, 目标 105, 一直过曝)。
+            n = int(round(AE['exp'] * ratio))
+            if n >= AE['exp']: n = AE['exp'] - 1
+            AE['exp'] = max(1, n); v4l2('exposure_absolute', AE['exp'])
+        elif AE['gain'] > 0:
+            # ★ 同上, 原为 AE['gain'] / ratio
+            n = int(round(AE['gain'] * ratio))
+            if n >= AE['gain']: n = AE['gain'] - 1
+            AE['gain'] = max(0, n); v4l2('gain', AE['gain'])
+
+def apply_corr(img):
+    """通道校正: 修品红偏色(红外漏光导致 G 被压低)。cv2 是 BGR 序"""
+    m = CORR['mode']
+    if m == 'off':
+        return img
+    f = img.astype(np.float32)
+    if m == 'gray':
+        means = [f[:, :, i].mean() for i in range(3)]
+        tgt = sum(means) / 3.0
+        inst = [min(max(tgt / max(x, 1e-6), 0.25), 4.0) for x in means]
+        for i in range(3):
+            CORR_G[i] += CORR_ALPHA * (inst[i] - CORR_G[i])
+        gains = CORR_G
+    else:
+        gains = [CORR['b'], CORR['g'], CORR['r']]
+    for i in range(3):
+        f[:, :, i] *= gains[i]
+    return np.clip(f, 0, 255).astype(np.uint8)
+
+
+def _stats(img):
+    b, g, r = [float(img[:, :, i].mean()) for i in range(3)]
+    return dict(b=round(b,1), g=round(g,1), r=round(r,1), mag=round(g-(r+b)/2.0,1))
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path == '/' or self.path.startswith('/index'):
+            try:
+                body = open('/home/amov/guttermap/preview.html', 'rb').read()
+            except Exception:
+                body = b'<h1>preview.html missing</h1>'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+        elif self.path.startswith('/frame_raw.jpg'):
+            j = STATE.get('jpeg')      # ★ raw 已废弃
+            if j is None:
+                self.send_error(503); return
+            self.send_response(200)
+            self.send_header('Content-Type','image/jpeg')
+            self.send_header('Content-Length',str(len(j)))
+            self.end_headers(); self.wfile.write(j)
+        elif self.path.startswith('/api/monitor'):
+            try:
+                body = open('/home/amov/guttermap/run/monitor.json', 'rb').read()
+            except Exception:
+                body = b'{}'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+        elif self.path.startswith('/map.jpg'):
+            try:
+                body = open('/home/amov/guttermap/run/map_view.jpg','rb').read()
+            except Exception:
+                body = b''
+            if not body:
+                self.send_error(503); return
+            self.send_response(200)
+            self.send_header('Content-Type','image/jpeg')
+            self.send_header('Content-Length',str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+        elif self.path.startswith('/api/corr'):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if 'mode' in q and q['mode'][0] in ('off','gray','man'):
+                CORR['mode'] = q['mode'][0]
+            for k in ('r','g','b'):
+                if k in q:
+                    try: CORR[k] = max(0.2, min(4.0, float(q[k][0])))
+                    except Exception: pass
+            b = json.dumps(CORR).encode()
+            self.send_response(200)
+            self.send_header('Content-Type','application/json')
+            self.send_header('Content-Length',str(len(b)))
+            self.end_headers(); self.wfile.write(b)
+        elif self.path.startswith('/video_feed'):
+            _key = 'jpeg'      # ★ raw 流已废弃, 统一用检测画面
+            self.send_response(200)
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+            try:
+                while True:
+                    j = STATE.get(_key)
+                    if j:
+                        self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '
+                                         + str(len(j)).encode() + b'\r\n\r\n')
+                        self.wfile.write(j)
+                        self.wfile.write(b'\r\n')
+                    time.sleep(0.05)
+            except Exception:
+                pass
+        elif self.path.startswith('/frame.jpg'):
+            j = STATE['jpeg']
+            if j is None:
+                self.send_error(503); return
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Content-Length', str(len(j)))
+            self.end_headers(); self.wfile.write(j)
+        elif self.path.startswith('/api/telemetry'):
+            _d = {k: STATE[k] for k in ('off','ang','conf','det','fps','x0','x1','y0','y1','wpx','held')}
+            _d['corr'] = dict(CORR)
+            _d['ae'] = {'on': AE['on'], 'target': AE['target'], 'gain': AE['gain'], 'exp': AE['exp'],
+                        'bright': round(AE['bright'],1), 'gain_max': AE['gain_max']}
+            _d['rb_b'] = STATE['rb_b']; _d['rb_g'] = STATE['rb_g']; _d['rb_r'] = STATE['rb_r']
+            _d['cb_b'] = STATE['cb_b']; _d['cb_g'] = STATE['cb_g']; _d['cb_r'] = STATE['cb_r']
+            _d['rmag'] = STATE['rmag']; _d['cmag'] = STATE['cmag']
+            _d['magenta'] = STATE['rmag']
+            b = json.dumps(_d).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(b)))
+            self.end_headers(); self.wfile.write(b)
+        else:
+            self.send_error(404)
+
+from socketserver import ThreadingMixIn
+class _TS(ThreadingMixIn, HTTPServer):
+    daemon_threads = True          # py3.6 无 ThreadingHTTPServer, 自己拼
+def serve():
+    _TS(('0.0.0.0', 8080), H).serve_forever()
+
+threading.Thread(target=serve, daemon=True).start()
+
+cfg = default_config
+apply_jetson_px4(cfg)
+cfg.camera.width = 640       # 2026-09-18: 试过1280x720, 清晰度+1.5倍但fps掉到5, 回退
+cfg.camera.height = 480
+det = TroughDetector(cfg)
+cap = cv2.VideoCapture(cfg.camera.camera_id)
+# ★★ 2026-09-18 排查结论: OpenCV 3.3.1 这行 set(FOURCC) 是【静默失败】的!
+#    set 之后 cap.get(FOURCC) 返回无效值 ÿÿÿÿ, 设备实际停在 YUYV。
+#    用 v4l2-ctl 预设 MJPG 也没用 —— OpenCV 打开时会用自己的默认格式覆盖回 YUYV。
+#    实测(v4l2-ctl 原生 streaming, 绕开 OpenCV):
+#        MJPG 640x480 = 121fps   ← 硬件真实能力
+#        YUYV 640x480 =  30fps   ← 当前实际被卡在这里
+#    也就是说本行代码写了等于没写, 帧率白丢 4 倍上限(还导致 1280x720 掉到 5fps)。
+#    下面 _real_fmt() 会把驱动里的真实格式打出来 —— 信它, 别信"MJPEG 已设"。
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.camera.width)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.camera.height)
+cap.set(cv2.CAP_PROP_FPS, 30)
+_no_cam = not cap.isOpened()
+if _no_cam:
+    print('!! 相机打不开 —— 只服务网页(无画面), 供调 UI/监控用')
+cam_init()
+print('[udp] 相机基准已应用: gamma=100 brightness=0 gain=60 exp=128 (与 cam_init 实际写入一致)')
+def _real_fmt():
+    """读驱动真实格式/分辨率 —— cap.get(FOURCC) 在 cv2 3.3.1 上不可信"""
+    try:
+        o = subprocess.check_output(['v4l2-ctl', '-d', DEV, '--get-fmt-video'],
+                                    stderr=subprocess.DEVNULL).decode()
+        pix = wh = '?'
+        for ln in o.split(chr(10)):
+            if 'Pixel Format' in ln: pix = ln.split(':')[-1].strip().strip(chr(39))
+            if 'Width/Height' in ln: wh = ln.split(':')[-1].strip()
+        return pix, wh
+    except Exception:
+        return '?', '?'
+
+_pix, _wh = _real_fmt()
+print('[udp] 相机 ok  %dx%d  预览 http://0.0.0.0:8080/frame.jpg' % (cap.get(3), cap.get(4)))
+print('[udp] 实际格式: %s  %s   fps=%.1f' % (_pix, _wh, cap.get(cv2.CAP_PROP_FPS)))
+if _pix == 'YUYV':
+    print('[udp] !! 相机跑在 YUYV —— 帧率被限在 30fps (MJPG 可达 121fps)。见上方 set(FOURCC) 说明')
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+SAVE_VIDEO = True        # ★ 2026-09-20: 打开录像(手飞看识别效果)。
+                        #   代价 ~5ms/帧, 录到 <会话目录>/overlay.avi
+writer = None
+
+
+def _close_writer():
+    """退出时收尾录像 —— 否则 AVI 索引不完整, 有些播放器读不出时长"""
+    global writer
+    try:
+        if writer is not None:
+            writer.release()
+            print('[rec] 录像已保存: %s' % VIDEO, flush=True)
+            writer = None
+    except Exception:
+        pass
+
+
+import atexit
+import signal as _signal
+atexit.register(_close_writer)
+
+
+def _on_term(_s, _f):
+    _close_writer()
+    raise SystemExit(0)
+
+
+for _s in (_signal.SIGTERM, _signal.SIGINT):
+    try:
+        _signal.signal(_s, _on_term)
+    except Exception:
+        pass
+csvf = None
+n = 0; t0 = time.time()
+fps_win = [None, 0]
+current_fps = 0.0
+while True:
+    _t0 = time.time()
+    ok, frame = cap.read()
+    if not ok:
+        time.sleep(0.2)
+        if _no_cam:
+            try: STATE['jpeg'] = STATE['jpeg'] or b''
+            except Exception: pass
+        continue
+    t_cap = time.time()
+    T_PROF = {'read': t_cap - _t0, 'cap': t_cap}
+    frame_raw = frame.copy()
+    frame = apply_corr(frame)
+    _t1 = time.time(); r = det.detect(frame); T_PROF['infer'] = time.time() - _t1
+    # 建图用【未钳制】的原始测量; 控制侧的 15mm/帧 钳制不影响这里
+    _det = bool(getattr(r, 'detected', False))
+    # ★ 2026-09-18: detected=False 时把 offset/angle 归零。
+    #   原来是无条件取 result 的字段, 而"未检测"时 result 里仍残留上一帧的值,
+    #   于是页面出现 "SEG no mask" 配 1228.6mm 这种自相矛盾, 发出去的 UDP 包
+    #   也带着脏值。注意: hold 时 detected 仍为 True(那是设计, 保持控制量),
+    #   servo_track 也会自己检查 detected, 所以这个改动不影响控制逻辑。
+    _off = float(getattr(r, 'offset_mm_raw', 0.0) or getattr(r, 'offset_mm', 0.0)) if _det else 0.0
+    msg = {'t': t_cap, 't_proc': time.time(),   # t=帧时刻, t_proc=处理完时刻
+           'offset_mm': _off,
+           'offset_mm_clamped': float(getattr(r, 'offset_mm', 0.0)) if _det else 0.0,
+           'angle_deg': float(getattr(r, 'angle_deg', 0.0)) if _det else 0.0,
+           'conf': float(getattr(r, 'confidence', 0.0)),
+           'detected': _det,
+           'held': bool(getattr(r, 'held', False)),
+           'wpx': float(getattr(r, 'trough_width_px', 0.0)),
+           'valid': bool(getattr(r, 'valid', True)),
+           'reason': str(getattr(r, 'invalid_reason', '') or '')}   # 诊断: 槽宽(像素)
+    try:
+        _lp = getattr(r, 'left_points', None); _rp = getattr(r, 'right_points', None)
+        if _lp and _rp and len(_lp) > 1 and len(_rp) > 1:
+            _a = np.asarray(_lp, dtype=float); _b = np.asarray(_rp, dtype=float)
+            _p = np.vstack([_a, _b])
+            STATE['x0'] = int(_p[:, 0].min()); STATE['x1'] = int(_p[:, 0].max())
+            STATE['y0'] = int(_p[:, 1].min()); STATE['y1'] = int(_p[:, 1].max())
+        else:
+            STATE['x0'] = STATE['x1'] = STATE['y0'] = STATE['y1'] = -1
+        STATE['wpx'] = float(getattr(r, 'trough_width_px', 0.0))
+        STATE['held'] = bool(getattr(r, 'held', False))
+    except Exception:
+        pass
+    _pkt = json.dumps(msg).encode('utf-8')
+    sock.sendto(_pkt, ('127.0.0.1', PORT))          # 建图
+    sock.sendto(_pkt, ('127.0.0.1', PORT_SERVO))     # 伺服
+    if csvf is None:
+        csvf = open(os.path.join(SESSION, 'detect.csv'), 'w')
+        csvf.write('t,offset_mm,angle_deg,conf,detected,model_s,wpx,valid\n')
+    # ★ 2026-09-20 诊断: 单独记录模型的原始分割分 model_s。
+    #   因为 conf = max(geo*0.5, model_s, 0.35), 只记 conf 无法判断
+    #   "conf 低" 到底是模型自己不自信, 还是被 geo*0.5 这个 0.5 天花板压住了。
+    _model_s = float(getattr(det, '_last_seg_score', 0.0))
+    csvf.write('%.4f,%.2f,%.2f,%.3f,%d,%.3f,%.1f,%d\n' % (msg['t'], msg['offset_mm'],
+                                              msg['angle_deg'], msg['conf'],
+                                              int(msg['detected']), _model_s,
+                                              msg.get('wpx', 0.0), int(msg.get('valid', True))))
+    if n % 15 == 0: csvf.flush()
+    n += 1
+    if fps_win[0] is None:            # ★ 滑动窗口测帧率, 排除启动时的 TRT 加载
+        fps_win[0] = time.time(); fps_win[1] = 0
+    fps_win[1] += 1
+    _el = time.time() - fps_win[0]
+    if _el >= 3.0:
+        fps = fps_win[1] / _el; current_fps = fps; fps_win[0] = None
+    else:
+        fps = current_fps if 'current_fps' in dir() else 0.0
+    STATE.update(off=msg['offset_mm'], ang=msg['angle_deg'], conf=msg['conf'],
+                 det=msg['detected'], fps=round(fps, 1), valid=msg.get('valid', True))
+    # 叠加文字 + 编码预览
+    if n % RAW_EVERY == 0:                              # 存传感器原图(未校正), 训练用
+        cv2.imwrite(os.path.join(RAW_DIR, 'raw_%06d.jpg' % n), frame_raw,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    try:
+        frame = _build_web_preview_lite(
+            frame, r, cfg=cfg,
+            mask=getattr(det, '_last_seg_mask', None))   # 叠加模型 mask 供诊断
+    except Exception as e:
+        cv2.putText(frame, 'overlay err: %r' % (e,), (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+    col = (0, 255, 0) if msg['conf'] >= 0.6 else (0, 165, 255)
+    cv2.putText(frame, 'conf=%0.2f %s' % (msg['conf'], 'OK' if msg['conf'] >= 0.6 else 'LOW'),
+                (8, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2, cv2.LINE_AA)
+    if time.time() - AE['last'] > 2.0:
+        AE['last'] = time.time()
+        try:
+            AE['bright'] = float(cv2.cvtColor(frame_raw, cv2.COLOR_BGR2GRAY).mean())
+            ae_step(AE['bright'])
+        except Exception:
+            pass
+    if n % 5 == 0:                       # ★ 颜色统计每5帧一次 (纯监控, 省 ~3ms/帧)
+        try:
+            _sr = _stats(frame_raw); _sc = _stats(frame)
+            STATE.update(rb_b=_sr['b'], rb_g=_sr['g'], rb_r=_sr['r'], rmag=_sr['mag'],
+                         cb_b=_sc['b'], cb_g=_sc['g'], cb_r=_sc['r'], cmag=_sc['mag'])
+        except Exception:
+            pass
+    _t2 = time.time()
+    ok2, jb = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    T_PROF['enc'] = time.time() - _t2
+    if ok2: STATE['jpeg'] = jb.tobytes()
+    # ★ 2026-09-18: 原始流(raw)已去掉 —— 页面不再显示, 省掉每3帧一次的 JPEG 编码
+    if SAVE_VIDEO:
+        if writer is None:
+            # ★ 2026-09-20: fps 15->30。实际写入约 27~30 帧/秒, 声明 15 会快放近一倍
+            writer = cv2.VideoWriter(VIDEO, cv2.VideoWriter_fourcc(*'MJPG'), 30.0,
+                                     (frame.shape[1], frame.shape[0]))
+            print('[rec] 开始写 %s (MJPG %dx%d @30)' % (VIDEO, frame.shape[1], frame.shape[0]), flush=True)
+        _t3 = time.time(); writer.write(frame); T_PROF['vid'] = time.time() - _t3
+    else:
+        T_PROF['vid'] = 0.0
+    if n % 40 == 0:
+        _tp = T_PROF
+        print('[udp] %d 帧 %.1ffps  off=%+.1fmm ang=%+.1f° conf=%.2f | 读帧%.0f 推理%.0f 编码%.0f 录像%.0f ms' % (
+            n, fps, msg['offset_mm'], msg['angle_deg'], msg['conf'],
+            _tp.get('read',0)*1000, _tp.get('infer',0)*1000, _tp.get('enc',0)*1000, _tp.get('vid',0)*1000), flush=True)
