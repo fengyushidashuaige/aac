@@ -1,0 +1,1517 @@
+"""
+PVC水槽中心线检测器。
+
+默认 (config.yolo.enabled=True):
+  YOLO-seg RKNN → mask → 中心线 → offset_mm / angle_deg
+
+备用 (yolo.enabled=False):
+  传统视觉（白度/HSV/Canny+Hough 等）→ 中心线
+"""
+
+import cv2
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+import time
+
+from config import (
+    Config, PreprocessConfig, CannyConfig, HoughConfig,
+    TroughConfig, CameraConfig, YoloConfig, default_config,
+)
+from gutter_seg import GutterSegInfer, mask_to_centerline, extend_mask_along_trough, _oriented_long_short
+
+
+@dataclass
+class CenterLineResult:
+    """中心线检测结果"""
+    # 横向偏移 (毫米，正值=水槽在右侧，负值=水槽在左侧)
+    offset_mm: float = 0.0
+
+    # 钳制【之前】的原始测量值 —— 建图/记录必须用这个
+    # (offset_mm 被"瞬移钳制"限速到 15mm/帧, 用于控制防跳变;
+    #  但记录/建图需要真实测量值, 否则重捕获时会记录成匀速爬坡的假值)
+    offset_mm_raw: float = 0.0
+
+    # 偏移量 (像素，鸟瞰图坐标系)
+    offset_px: float = 0.0
+
+    # 水槽中心线角度 (弧度，0=垂直向上，正值=顺时针)
+    angle_rad: float = 0.0
+
+    # 水槽中心线角度 (度)
+    angle_deg: float = 0.0
+
+    # 检测到的水槽宽度 (像素)
+    trough_width_px: float = 0.0
+
+    # 检测置信度 (0-1)
+    confidence: float = 0.0
+
+    # 是否为丢检保持帧（无几何，仅保控制）
+    held: bool = False
+
+    # 左边界点集 [(x,y), ...]
+    left_points: List[Tuple[float, float]] = None
+
+    # 右边界点集 [(x,y), ...]
+    right_points: List[Tuple[float, float]] = None
+
+    # 原始检测到的所有线段
+    raw_lines: List[np.ndarray] = None
+
+    # 是否成功检测到水槽
+    detected: bool = False
+
+    # --- 2026-09-22: geometry validity of THIS frame's offset ---
+    # valid=False means offset_mm is not trustworthy (trough partly out of
+    # frame / beyond lateral FOV), NOT merely low model confidence.
+    valid: bool = False
+    invalid_reason: str = ''
+
+    # 处理耗时 (毫秒)
+    processing_time_ms: float = 0.0
+
+    def __post_init__(self):
+        if self.left_points is None:
+            self.left_points = []
+        if self.right_points is None:
+            self.right_points = []
+        if self.raw_lines is None:
+            self.raw_lines = []
+
+
+class TroughDetector:
+    """
+    PVC水槽中心线检测器
+
+    使用示例:
+        detector = TroughDetector(config)
+        result = detector.detect(frame)
+        if result.detected:
+            print(f"偏移: {result.offset_mm:.1f}mm, 角度: {result.angle_deg:.1f}°")
+    """
+
+    def __init__(self, config: Config = None):
+        self.config = config or default_config
+
+        # --- CLAHE (自适应直方图均衡化) ---
+        self.clahe = cv2.createCLAHE(
+            clipLimit=self.config.preprocess.clahe_clip_limit,
+            tileGridSize=(self.config.preprocess.clahe_tile_size,
+                          self.config.preprocess.clahe_tile_size),
+        )
+
+        # --- 透视变换矩阵 (延迟初始化，在第一次detect时计算) ---
+        self._perspective_M: Optional[np.ndarray] = None
+        self._perspective_M_inv: Optional[np.ndarray] = None
+        self._perspective_initialized: bool = False
+
+        # --- EMA时序平滑状态 ---
+        self._ema_offset: Optional[float] = None     # EMA平滑后的偏移
+        self._ema_angle: Optional[float] = None      # EMA平滑后的角度
+        self._ema_alpha: float = 0.45                 # 更粘：约 10% 新值，减 offset 跳动
+        self._ema_center_x: Optional[float] = None   # EMA平滑后的中心X坐标
+        self._last_clamp_mm: Optional[float] = None  # 输出级瞬移钳制: 上一帧 offset_mm
+
+        # --- 中值滤波缓冲区 (抗抖动) ---
+        self._offset_history: list = []   # 最近N帧的原始偏移
+        self._history_max: int = 3        # 缓冲长度
+
+        # --- 时间一致性: 记录上次检测位置，优先锁定同一目标 ---
+        self._last_center_x: Optional[float] = None
+        # ★ 2026-09-20: 上一帧【通过门控】的槽宽, 供宽度突变门控使用
+        self._last_ok_width: float = 0.0
+        # 2026-09-22: rolling width reference (85th pct). Deliberately NOT
+        # cleared by reset(): it is a slow, absolute reference.
+        self._w_buf = []
+
+        # --- 卡尔曼滤波器 (简化版1D卡尔曼，用于偏移量跟踪) ---
+        self._kalman = self._init_simple_kalman()
+
+        # --- 短暂丢检保持: 仅保持控制量，不冻结画线几何 ---
+        self._hold_offset_px: Optional[float] = None
+        self._hold_angle_rad: Optional[float] = None
+        self._hold_width: Optional[float] = None
+        self._hold_left: int = 0
+        self._hold_max: int = 18  # 侧向/果冻短丢检多撑几帧
+
+        # --- 实例跟踪: 偏好上一帧目标，晃动/多候选时更稳 ---
+        self._track_cx: Optional[float] = None  # letterbox 坐标
+        self._track_cy: Optional[float] = None
+        self._mask_scale_x: float = 1.0
+        self._mask_scale_y: float = 1.0
+        self._proto_flat = None
+        self._lock_mid_x: Optional[float] = None
+        self._lock_slope: Optional[float] = None
+        self._lock_intercept: Optional[float] = None
+        self._lock_width: Optional[float] = None
+        self._lock_vx: Optional[float] = None
+        self._lock_vy: Optional[float] = None
+        self._lock_area: Optional[float] = None      # mask 一致性门控
+        self._angle_ref: Optional[float] = None      # 角度慢参考（门控判翻转用）
+        self._lock_bad_streak: int = 0
+        # 一致性门控：面积/角度突变时短暂保持，但连续同向真移动要跟得上
+        self._lock_gate: bool = True
+        # 正常每帧最多跟这么多像素；同向连续移动时放宽（防手晃跟丢）
+        self._center_max_step_px: float = 14.0
+        self._center_max_step_fast_px: float = 28.0
+        self._center_dir_streak: int = 0
+        self._center_last_dir: int = 0
+
+        # --- 运行统计 ---
+        self.frame_count: int = 0
+        self.detect_count: int = 0
+        self.last_detect_time: float = 0.0
+
+    # ═══════════════════════════════════════════════════════════
+    # 公开接口
+    # ═══════════════════════════════════════════════════════════
+
+    def detect(self, frame: np.ndarray) -> CenterLineResult:
+        """检测水槽中心线: YOLO-seg优先, HSV传统备选"""
+        t_start = time.perf_counter()
+        self.frame_count += 1
+
+        if self.config.yolo.enabled:
+            result = self._detect_yolo_seg(frame)
+            # 几何合理性门控，丢掉横条/碎噪声（倾角放宽）
+            if result.detected:
+                a = float(result.angle_deg or 0.0)
+                # 非有限值配合while归一化会形成死循环；判无效后继续走 hold/offset_mm
+                if not np.isfinite(a):
+                    result.detected = False
+                    result.confidence = 0.0
+                else:
+                    a = ((a + 90.0) % 180.0) - 90.0
+                    result.angle_deg = a
+                    result.angle_rad = float(np.radians(a))
+                    ang = abs(a)
+                    wpx = float(result.trough_width_px or 0.0)
+                    pts = list(result.left_points or []) + list(result.right_points or [])
+                    near_y = max((float(p[1]) for p in pts), default=-1.0)
+                    far_y = min((float(p[1]) for p in pts), default=1e9)
+                    span_y = (near_y - far_y) if near_y >= 0.0 and far_y < 1e8 else 0.0
+                    H = float(frame.shape[0])
+                    W = float(frame.shape[1])
+                    ignore_bot = float(getattr(self.config.yolo, "mask_bottom_ignore", 0.0) or 0.0)
+                    # 槽偏左右时（机在另一侧）几何更碎/更短，门控过严会误杀
+                    if pts:
+                        cx_m = float(np.mean([float(p[0]) for p in pts]))
+                        side = abs(cx_m - 0.5 * W) / max(0.5 * W, 1.0)
+                    else:
+                        side = 0.0
+                    if ignore_bot > 0.05:
+                        if side > 0.22:
+                            misses_roi = near_y < H * 0.06 or far_y > H * 0.88
+                        else:
+                            misses_roi = near_y < H * 0.16 or far_y > H * 0.72
+                    else:
+                        misses_roi = near_y < H * 0.48
+                    # 拒绝仅贴在画面底部的短目标（机头涵道喷管等）
+                    bot_y0 = 0.58 if side > 0.22 else 0.58
+                    span_min = 0.12 if side > 0.22 else 0.20
+                    bottom_only_short = (
+                        len(pts) > 0
+                        and far_y > H * bot_y0
+                        and span_y < H * span_min
+                    )
+                    # ★ 2026-09-20: 8/14 -> 15/30。原来 14px(甚至 8px)就算"检测到水槽",
+                    #   实测误检明显。图像宽 640, 正常作业距离下槽应有 60~200px,
+                    #   十几像素那种是碎片/杂物边缘。
+                    wmin = 15.0 if side > 0.22 else 30.0
+                    # ★ 2026-09-20 新增: 宽度突变门控。
+                    #   实测现象"突然只检测到水槽一小部分" -> 宽度暴跌 ->
+                    #   _px_to_mm 里 mm_per_px = trough_width_mm / trough_width_px
+                    #   的分母变小, offset_mm 被成倍放大(100px->20px 放大 5 倍),
+                    #   控制量瞬间暴走。这种帧判无效, 交给上层 hold 保持上次控制量,
+                    #   比用错误宽度算出的暴走 offset 安全得多。
+                    w_shrink = (self._last_ok_width > 25.0
+                                and wpx < self._last_ok_width * 0.60)
+                    if (ang > 70.0 or wpx < wmin
+                            or wpx > min(frame.shape[1] * 0.55, 320.0)
+                            or misses_roi
+                            or bottom_only_short
+                            or w_shrink):
+                        result.detected = False
+                        result.confidence = 0.0
+                    else:
+                        # 跟手锁定：更快跟上槽心；叠线用本帧真实中点
+                        old_a, old_h = self._ema_alpha, self._history_max
+                        self._ema_alpha = 0.55
+                        self._history_max = 2
+                        result = self._temporal_smooth(result)
+                        self._ema_alpha, self._history_max = old_a, old_h
+                        self._hold_offset_px = float(result.offset_px)
+                        self._hold_angle_rad = float(result.angle_rad)
+                        self._hold_width = float(result.trough_width_px or 0.0)
+                        self._hold_left = self._hold_max
+                        self._last_ok_width = max(float(wpx), 0.0)   # ★ 记录本帧宽度
+            if (not result.detected) and self._hold_left > 0 and self._hold_offset_px is not None:
+                # 仅保持控制量；清空边线，避免旧黄线贴在新画面上“脱槽”
+                self._hold_left -= 1
+                result = CenterLineResult(
+                    offset_px=float(self._hold_offset_px),
+                    angle_rad=float(self._hold_angle_rad or 0.0),
+                    angle_deg=float(np.degrees(self._hold_angle_rad or 0.0)),
+                    trough_width_px=float(self._hold_width or 0.0),
+                    left_points=[],
+                    right_points=[],
+                    detected=True,
+                    held=True,
+                    valid=True,
+                    confidence=0.65,  # 2026-09-12: 0.42->0.65
+                    # hold 帧需过 controller.min_accept_conf(0.6)门槛
+                )
+                self._last_center_pts = None
+            elif not result.detected:
+                self._lock_mid_x = None
+                self._lock_slope = None
+                self._lock_intercept = None
+                self._lock_width = None
+                self._lock_vx = None
+                self._lock_vy = None
+                self._center_dir_streak = 0
+                self._center_last_dir = 0
+        else:
+            gray = self._preprocess(frame)
+            warped_gray = self._warp_perspective(gray)
+            warped_color = self._warp_perspective_color(frame)
+            result = self._detect_trough_white(warped_gray, warped_color)
+            result = self._temporal_smooth(result)
+
+        result.offset_mm = self._px_to_mm(
+            result.offset_px, result.trough_width_px
+        )
+        result.offset_mm_raw = result.offset_mm   # 2026-09-16: 钳制前留存, 建图用
+        # 瞬移钳制(输出级, 2026-08-13): 无论哪条检测路径产出, offset_mm 单帧最多移动 15mm。
+        # 真实极限≈横移30mm/s+偏航0.04rad/s×2m≈4mm/帧, 取 15mm/帧≈4倍余量防影子误检瞬移
+        if result.detected and self._last_clamp_mm is not None:
+            d = result.offset_mm - self._last_clamp_mm
+            if d > 15.0:
+                result.offset_mm = self._last_clamp_mm + 15.0
+            elif d < -15.0:
+                result.offset_mm = self._last_clamp_mm - 15.0
+        if result.detected:
+            self._last_clamp_mm = result.offset_mm
+        else:
+            # 2026-09-22: do not slew back from a rejected measurement -- one
+            # bad frame would otherwise walk 15 mm/frame for ~40 frames.
+            self._last_clamp_mm = None
+        if self.config.yolo.enabled and result.detected:
+            # YOLO: 几何置信度与模型分数取较大者，避免 RKNN 分数偏低被误杀
+            geo = self._calc_confidence(result)
+            model_s = float(getattr(self, "_last_seg_score", 0.0))
+            result.confidence = max(geo * 0.5, model_s, 0.35 if result.detected else 0.0)
+            # YOLO 模式放宽门限
+            if result.confidence < 0.2:
+                result.detected = False
+        else:
+            result.confidence = self._calc_confidence(result)
+            # 2026-09-22: non-YOLO (white) path has its own gating -> mark valid
+            if result.detected:
+                result.valid = True
+            if result.confidence < 0.4:
+                result.detected = False
+        result.processing_time_ms = (time.perf_counter() - t_start) * 1000
+
+        if result.detected:
+            self.detect_count += 1
+        return result
+
+    def reset(self):
+        """重置时序平滑状态(切换场景时调用)"""
+        self._ema_offset = None
+        self._ema_angle = None
+        self._ema_center_x = None
+        self._offset_history = []
+        self._last_center_x = None
+        self._hold_offset_px = None
+        self._hold_angle_rad = None
+        self._hold_width = None
+        self._hold_left = 0
+        self._last_center_pts = None
+        self._track_cx = None
+        self._track_cy = None
+        self._mask_scale_x = 1.0
+        self._mask_scale_y = 1.0
+        self._lock_mid_x = None
+        self._lock_slope = None
+        self._lock_intercept = None
+        self._lock_width = None
+        self._lock_vx = None
+        self._lock_vy = None
+        self._lock_area = None
+        self._angle_ref = None
+        self._lock_bad_streak = 0
+        self._center_dir_streak = 0
+        self._center_last_dir = 0
+        self._kalman = self._init_simple_kalman()
+
+    # ═══════════════════════════════════════════════════════════
+    # 步骤1: 预处理
+    # ═══════════════════════════════════════════════════════════
+
+    def _preprocess(self, frame: np.ndarray) -> np.ndarray:
+        """灰度化 + CLAHE + 可选的去噪"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # CLAHE: 自适应直方图均衡化
+        # 在亮度不均的场景下(阴影、反光)非常关键
+        gray = self.clahe.apply(gray)
+
+        return gray
+
+    # ═══════════════════════════════════════════════════════════
+    # 步骤2: 透视变换 (消除45°前倾带来的透视畸变)
+    # ═══════════════════════════════════════════════════════════
+
+    def _init_perspective(self, img_h: int, img_w: int):
+        """初始化透视变换矩阵"""
+        tc = self.config.trough
+        out_w = tc.perspective_out_width
+        out_h = tc.perspective_out_height
+
+        # 源四边形: 地面ROI在原图中的4个角
+        src_pts = np.float32([
+            [tc.perspective_src[0][0] * img_w, tc.perspective_src[0][1] * img_h],  # 左上
+            [tc.perspective_src[1][0] * img_w, tc.perspective_src[1][1] * img_h],  # 右上
+            [tc.perspective_src[2][0] * img_w, tc.perspective_src[2][1] * img_h],  # 右下
+            [tc.perspective_src[3][0] * img_w, tc.perspective_src[3][1] * img_h],  # 左下
+        ])
+
+        # 目标矩形: 鸟瞰图
+        dst_pts = np.float32([
+            [0, 0],
+            [out_w, 0],
+            [out_w, out_h],
+            [0, out_h],
+        ])
+
+        self._perspective_M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        self._perspective_M_inv = cv2.getPerspectiveTransform(dst_pts, src_pts)
+        self._perspective_initialized = True
+
+    def _warp_perspective(self, gray: np.ndarray) -> np.ndarray:
+        """应用透视变换，得到鸟瞰图"""
+        h, w = gray.shape[:2]
+        if not self._perspective_initialized:
+            self._init_perspective(h, w)
+
+        tc = self.config.trough
+        out_w = tc.perspective_out_width
+        out_h = tc.perspective_out_height
+
+        return cv2.warpPerspective(gray, self._perspective_M, (out_w, out_h))
+
+    def _warp_perspective_color(self, bgr: np.ndarray) -> np.ndarray:
+        """透视变换彩色图 → 鸟瞰图"""
+        h, w = bgr.shape[:2]
+        if not self._perspective_initialized:
+            self._init_perspective(h, w)
+        tc = self.config.trough
+        return cv2.warpPerspective(bgr, self._perspective_M,
+                                   (tc.perspective_out_width, tc.perspective_out_height))
+
+    def warp_to_original(self, px: float, py: float,
+                          img_h: int, img_w: int) -> Tuple[float, float]:
+        """将鸟瞰图坐标映射回原图坐标"""
+        if not self._perspective_initialized:
+            self._init_perspective(img_h, img_w)
+
+        pt = np.float32([[[px, py]]])
+        pt_orig = cv2.perspectiveTransform(pt, self._perspective_M_inv)
+        return float(pt_orig[0][0][0]), float(pt_orig[0][0][1])
+
+    # ═══════════════════════════════════════════════════════════
+    # YOLO-seg 检测
+    # ═══════════════════════════════════════════════════════════
+
+    def _blank_bottom_roi(self, frame: np.ndarray) -> np.ndarray:
+        """屏蔽画面底部（涵道喷管），避免白色喷管被当成水槽。"""
+        frac = float(getattr(self.config.yolo, "mask_bottom_ignore", 0.0) or 0.0)
+        if frame is None or frac <= 0.01:
+            return frame
+        frac = float(np.clip(frac, 0.05, 0.70))
+        out = frame.copy()
+        y0 = int(out.shape[0] * (1.0 - frac))
+        out[y0:, :] = (114, 114, 114)
+        return out
+
+    def _crop_mask_bottom(self, mask: np.ndarray) -> np.ndarray:
+        frac = float(getattr(self.config.yolo, "mask_bottom_ignore", 0.0) or 0.0)
+        if mask is None or frac <= 0.01:
+            return mask
+        frac = float(np.clip(frac, 0.05, 0.70))
+        m = mask.copy()
+        y0 = int(m.shape[0] * (1.0 - frac))
+        m[y0:, :] = 0
+        return m
+
+    def _detect_yolo_seg(self, frame: np.ndarray) -> CenterLineResult:
+        """YOLO-seg: 与离线一致 — mask → 全图中心线 → 近端带 + polyfit 偏移"""
+        R = CenterLineResult()
+        h, w = frame.shape[:2]
+        yc = self.config.yolo
+        cx_img = w * 0.5
+        # 推理用图：底部喷管涂灰；轻模糊抑制卷帘果冻高频扭曲对分割的干扰
+        frame_det = self._blank_bottom_roi(frame)
+        kblur = int(getattr(yc, "infer_blur_ksize", 0) or 0)
+        if kblur >= 3:
+            kblur = kblur | 1
+            frame_det = cv2.GaussianBlur(frame_det, (kblur, kblur), 0)
+
+        # --- 推理: RKNN / TensorRT(.engine) / PT(Ultralytics) ---
+        if yc.weights.endswith(".rknn"):
+            if not hasattr(self, "_rknn"):
+                from rknnlite.api import RKNNLite
+
+                self._rknn = RKNNLite()
+                self._rknn.load_rknn(yc.weights)
+                self._rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
+            imgsz = int(yc.imgsz)
+            img_in, ratio, (dw, dh) = self._letterbox(frame_det, imgsz)
+            rgb = cv2.cvtColor(img_in, cv2.COLOR_BGR2RGB)
+            outputs = self._rknn.inference(inputs=[np.expand_dims(rgb, 0)])
+            if outputs is None:
+                return R
+            mask = self._rknn_postproc(
+                outputs[0], outputs[1], (h, w), imgsz, yc.conf, ratio, dw, dh, frame_det
+            )
+        elif yc.weights.endswith(".engine"):
+            if not hasattr(self, "_trt"):
+                import os
+                from infer_trt import YoloSegTRT, build_engine_from_onnx
+
+                eng = yc.weights
+                if not os.path.isfile(eng):
+                    onnx = eng.replace(".engine", ".onnx")
+                    if not os.path.isfile(onnx):
+                        onnx = "models/gutter_seg_320.onnx"
+                    print("[TRT] building engine from", onnx)
+                    build_engine_from_onnx(onnx, eng, fp16=True)
+                self._trt = YoloSegTRT(eng, imgsz=int(yc.imgsz))
+            imgsz = int(yc.imgsz)
+            img_in, ratio, (dw, dh) = self._letterbox(frame_det, imgsz)
+            rgb = cv2.cvtColor(img_in, cv2.COLOR_BGR2RGB)
+            det, proto = self._trt.infer(rgb)
+            if det is None or proto is None:
+                return R
+            mask = self._rknn_postproc(
+                det, proto, (h, w), imgsz, yc.conf, ratio, dw, dh, frame_det
+            )
+        else:
+            if not hasattr(self, "_yolo_infer"):
+                self._yolo_infer = GutterSegInfer(
+                    yc.weights, conf=yc.conf, imgsz=yc.imgsz, device=yc.device
+                )
+            mask, conf, _ = self._yolo_infer.predict_mask(frame_det)
+            if conf is not None:
+                self._last_seg_score = float(conf)
+
+        if mask is None:
+            self._last_seg_mask = None
+            return R
+        # 用白色先验收紧 mask，再取真实左右边中点 —— 线贴槽心，不靠“假黄线”
+        mask = self._refine_mask_to_trough(frame_det, mask)
+        mask = self._crop_mask_bottom(mask)
+        self._last_seg_mask = mask
+
+        sx = float(getattr(self, "_mask_scale_x", 1.0) or 1.0)
+        sy = float(getattr(self, "_mask_scale_y", 1.0) or 1.0)
+        mid = self._extract_mask_midline(mask)
+        if mid is None:
+            # 回退旧几何
+            area_scale = sx * sy
+            min_a = max(200.0, 800.0 / max(area_scale, 1.0))
+            min_a2 = max(100.0, 400.0 / max(area_scale, 1.0))
+            cl = mask_to_centerline(mask, min_area=min_a)
+            if cl is None:
+                cl = mask_to_centerline(mask, min_area=min_a2)
+            if cl is None:
+                return R
+            left_edges, right_edges, ys_arr, widths, angle_deg = cl
+            if abs(sx - 1.0) > 1e-3 or abs(sy - 1.0) > 1e-3:
+                left_edges = left_edges * sx
+                right_edges = right_edges * sx
+                ys_arr = ys_arr * sy
+                widths = widths * sx
+            mids = 0.5 * (left_edges + right_edges)
+        else:
+            left_edges, right_edges, ys_arr, widths, mids, angle_deg = mid
+            if abs(sx - 1.0) > 1e-3 or abs(sy - 1.0) > 1e-3:
+                left_edges = left_edges * sx
+                right_edges = right_edges * sx
+                ys_arr = ys_arr * sy
+                widths = widths * sx
+                mids = mids * sx
+
+        # 近端带: 倾角时更偏近端，远端 tip 少参与
+        if len(ys_arr) >= 8:
+            if abs(float(angle_deg)) > 8.0:
+                y_lo = float(np.percentile(ys_arr, 55))
+                y_hi = float(np.percentile(ys_arr, 98))
+            else:
+                y_lo = float(np.percentile(ys_arr, 40))
+                y_hi = float(np.percentile(ys_arr, 96))
+            band = (ys_arr >= y_lo) & (ys_arr <= y_hi)
+            if int(band.sum()) < 6:
+                band = np.ones(len(ys_arr), dtype=bool)
+        else:
+            band = np.ones(len(ys_arr), dtype=bool)
+
+        ys_b = ys_arr[band]
+        mids_b = mids[band]
+        lefts_b = left_edges[band]
+        rights_b = right_edges[band]
+        widths_b = widths[band]
+        width = float(np.median(widths_b)) if len(widths_b) else 50.0
+        ang_out = float(angle_deg)
+
+        # ── 控制：控制行 mask 中点（贴槽）；画线：过该点的软直线（不追弯）──
+        # 飞控只用 offset@ctrl_y + angle，折线弯曲本身不进控制；弯只影响观感/角度噪声
+        if len(ys_b) >= 5:
+            y_frac = float(getattr(yc, "ctrl_y_frac", 0.72) or 0.72)
+            y0b = float(ys_b.min())
+            y1b = float(ys_b.max())
+            y_ctrl = float(np.clip(h * y_frac, y0b, y1b))
+            y_span = float(y1b - y0b)
+            band_w = max(0.12 * y_span, 4.0)
+            ctrl_band = (ys_b >= y_ctrl - band_w) & (ys_b <= y_ctrl + band_w)
+            if int(ctrl_band.sum()) >= 3:
+                center_raw = float(np.median(mids_b[ctrl_band]))
+            else:
+                j = int(np.argmin(np.abs(ys_b - y_ctrl)))
+                center_raw = float(mids_b[j])
+            center_raw = float(np.clip(center_raw, 0.0, float(w)))
+
+            if self._lock_mid_x is None:
+                self._lock_mid_x = center_raw
+            else:
+                dc = abs(center_raw - float(self._lock_mid_x))
+                a_c = 0.55 if dc > 0.12 * float(w) else 0.85
+                self._lock_mid_x = a_c * center_raw + (1.0 - a_c) * float(self._lock_mid_x)
+            center_x = float(self._lock_mid_x)
+            width = float(np.median(widths_b)) if len(widths_b) else width
+            self._lock_width = (
+                width if self._lock_width is None
+                else 0.35 * width + 0.65 * float(self._lock_width)
+            )
+            width = float(self._lock_width)
+
+            # 角度：近端中点加权方向（远端弯少拉偏航），再重 EMA
+            order = np.argsort(ys_b)
+            ys_s = ys_b[order]
+            mids_s = mids_b[order]
+            # 近端(y大)权重大
+            wts = np.linspace(0.35, 1.0, len(ys_s))
+            wsum = float(wts.sum()) or 1.0
+            mx = float((mids_s * wts).sum() / wsum)
+            my = float((ys_s * wts).sum() / wsum)
+            # 协方差主成分（2D）
+            dx = mids_s - mx
+            dy = ys_s - my
+            cxx = float((wts * dx * dx).sum() / wsum)
+            cyy = float((wts * dy * dy).sum() / wsum)
+            cxy = float((wts * dx * dy).sum() / wsum)
+            # 最大特征值方向
+            tr = cxx + cyy
+            det = cxx * cyy - cxy * cxy
+            tmp = max(0.0, 0.25 * tr * tr - det)
+            l1 = 0.5 * tr + np.sqrt(tmp)
+            # 特征向量 ~ (cxy, l1-cxx) 或 (l1-cyy, cxy)
+            if abs(cxy) > 1e-6 or abs(l1 - cxx) > 1e-6:
+                vx, vy = float(cxy), float(l1 - cxx)
+            else:
+                vx, vy = 0.0, 1.0
+            nrm = float(np.hypot(vx, vy)) or 1.0
+            vx, vy = vx / nrm, vy / nrm
+            if vy < 0:
+                vx, vy = -vx, -vy
+            ang_raw = float(self._angle_vs_vertical(vx, vy))
+            if self._angle_ref is None:
+                self._angle_ref = ang_raw
+            else:
+                # 重平滑：弯/噪声少拽 yaw；真转弯仍会慢慢跟上
+                da = abs(ang_raw - float(self._angle_ref))
+                a_a = 0.35 if da > 12.0 else 0.12
+                self._angle_ref = a_a * ang_raw + (1.0 - a_a) * float(self._angle_ref)
+            ang_out = float(self._angle_ref)
+
+            # 画线：过锁定中心、用平滑角的软直线（贴槽心、不追 mask 弯）
+            slope = float(np.tan(np.radians(ang_out)))
+            intercept = center_x - slope * y_ctrl
+            n_pts = 12
+            ys_draw = np.linspace(y0b, y1b, n_pts)
+            half_w = 0.5 * width
+            c_pts = [(intercept + slope * float(y), float(y)) for y in ys_draw]
+            # 法向左右边（近似竖直法向即可）
+            nrm2 = float(np.hypot(slope, 1.0)) or 1.0
+            sux, suy = -1.0 / nrm2, slope / nrm2
+            R.left_points = [
+                (cx - sux * half_w, y - suy * half_w) for cx, y in c_pts
+            ]
+            R.right_points = [
+                (cx + sux * half_w, y + suy * half_w) for cx, y in c_pts
+            ]
+            self._last_center_pts = c_pts
+        else:
+            center_x = float(np.median(mids_b)) if len(mids_b) else cx_img
+            self._lock_mid_x = center_x
+            step = max(1, len(ys_b) // 16) if len(ys_b) else 1
+            idxs = list(range(0, len(ys_b), step))
+            R.left_points = [(float(lefts_b[i]), float(ys_b[i])) for i in idxs]
+            R.right_points = [(float(rights_b[i]), float(ys_b[i])) for i in idxs]
+            self._last_center_pts = [
+                (0.5 * (float(lefts_b[i]) + float(rights_b[i])), float(ys_b[i]))
+                for i in idxs
+            ]
+
+        R.detected = True
+        # 2026-09-23: 横向偏差改为"参考点到槽轴线的垂距"
+        # 旧: offset_px = 控制行上 mask 中点 - 画面中心 -> 水平方向的差。
+        #     槽在画面里斜着时, 水平差不等于到槽中心线的垂距, 且随相机角度变化。
+        # 新: 用 mask 的 PCA 主轴作为槽的中心线, 量参考点的垂距; 宽度也取垂向宽度,
+        #     这样 mm/px 的比例才与"垂距"同一个尺度。
+        # 符号与旧实现保持一致: 正值 = 槽轴线在参考点右侧。
+        _perp_done = False
+        try:
+            _m8 = (np.asarray(mask) > 0)
+            _yi, _xi = np.where(_m8)
+            if _xi.size >= 50:
+                _xi = _xi.astype(np.float64) * float(sx)
+                _yi = _yi.astype(np.float64) * float(sy)
+                _mx = float(_xi.mean())
+                _my = float(_yi.mean())
+                _dx = _xi - _mx
+                _dy = _yi - _my
+                _cov = np.array([[(float((_dx * _dx).mean())),
+                                  (float((_dx * _dy).mean()))],
+                                 [(float((_dx * _dy).mean())),
+                                  (float((_dy * _dy).mean()))]], dtype=np.float64)
+                _ev, _evec = np.linalg.eigh(_cov)
+                _lu = _evec[:, int(np.argmax(_ev))]
+                _nn = float(np.hypot(_lu[0], _lu[1])) or 1.0
+                _lu = _lu / _nn
+                _nx, _ny = -_lu[1], _lu[0]
+                if _nx < 0.0:
+                    _nx, _ny = -_nx, -_ny
+                _yf = float(getattr(getattr(self.config, 'yolo', None),
+                                    'ctrl_y_frac', 0.4) or 0.4)
+                _rx = float(cx_img)
+                _ry = float(h) * _yf
+                R.offset_px = float((_mx - _rx) * _nx + (_my - _ry) * _ny)
+                _s = _dx * _nx + _dy * _ny
+                _wp = float(_s.max() - _s.min())
+                if _wp > 10.0:
+                    R.trough_width_px = _wp
+                _perp_done = True
+        except Exception:
+            _perp_done = False
+        if not _perp_done:
+            R.offset_px = center_x - cx_img
+        R.angle_rad = float(np.radians(ang_out))
+        R.angle_deg = ang_out
+        R.trough_width_px = width
+        R.confidence = float(getattr(self, "_last_seg_score", 0.5))
+        R.offset_mm = self._px_to_mm(R.offset_px, R.trough_width_px)
+        self._gate_validity(R, float(w))
+        return R
+
+    def _gate_validity(self, R, img_w: float) -> None:
+        """2026-09-22: reject geometrically impossible offsets.
+
+        The old guard compared wpx against the previous accepted frame only;
+        a slow drift out of frame passes every step and walks the reference
+        down with it. Use an absolute rolling reference instead.
+        """
+        if not R.detected:
+            return
+        tw = float(getattr(self.config.trough, "trough_width_mm", 110.0) or 110.0)
+        w = float(R.trough_width_px or 0.0)
+        ref = float(np.percentile(self._w_buf, 85)) if len(self._w_buf) >= 8 else 0.0
+        if ref <= 1.0:
+            ref = float(getattr(self.config.trough, 'ref_width_px', 0.0) or 0.0)
+        reason = ''
+        if ref > 1.0 and w > 0.0:
+            off_lim = 0.5 * float(img_w) * (tw / ref)
+            if w < 0.55 * ref:
+                reason = 'width_shrink'
+            elif w > 1.60 * ref:
+                # 2026-09-22: a blob far wider than the reference is a different
+                # object (measured: blower tube 250px vs trough 130px), not the
+                # trough. Its mm/px is bogus in the other direction.
+                reason = 'width_oversize'
+            elif abs(float(R.offset_mm or 0.0)) > off_lim:
+                reason = 'off_over_fov'
+        if reason:
+            R.detected = False
+            R.valid = False
+            R.invalid_reason = reason
+            R.confidence = 0.0
+            return
+        R.valid = True
+        R.invalid_reason = ''
+        # Only widths near the current reference may move it. Without this a
+        # wide *wrong* object (e.g. 253px when the trough is ~130px) fills the
+        # buffer and the real trough is then rejected as a shrink.
+        if w > 1.0 and (ref <= 1.0 or 0.70 * ref <= w <= 1.55 * ref):
+            self._w_buf.append(w)
+            if len(self._w_buf) > 300:
+                self._w_buf.pop(0)
+
+    def _refine_mask_to_trough(self, frame_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """补洞 + 去碎块；倾斜时不用横向闭运算（会把中线水平拉偏）。"""
+        if mask is None:
+            return mask
+        m = mask if mask.dtype == np.uint8 else (mask > 0).astype(np.uint8)
+        # 各向同性闭运算即可，避免 (3,9) 横向抹偏
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+        cnts = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = cnts[1] if len(cnts) == 3 else cnts[0]
+        if not cnts:
+            return mask
+        cnt = max(cnts, key=cv2.contourArea)
+        out = np.zeros_like(m)
+        cv2.drawContours(out, [cnt], -1, 255, thickness=-1)
+        out = cv2.erode(out, np.ones((3, 3), np.uint8), iterations=1)
+        if int(cv2.countNonZero(out)) < 80:
+            return m
+        return out
+
+    def _extract_mask_midline(self, mask: np.ndarray):
+        """
+        沿槽心轴（质心+PCA）采样，短轴两侧真实边界的中点作为槽心。
+        中心只由左右边界决定，不受单侧壁厚和距离变换峰偏移影响。
+        """
+        if mask is None:
+            return None
+        m = mask if mask.dtype == np.uint8 else (mask > 0).astype(np.uint8)
+        h, w = m.shape[:2]
+        ys_all, xs_all = np.where(m > 0)
+        # 侧向偏出时 mask 像素更少，过严会直接 LOST
+        if xs_all.size < 50:
+            return None
+
+        # 质心 + PCA 主轴 = 槽中心线方向（不是外接框边）
+        pts = np.column_stack(
+            [xs_all.astype(np.float64), ys_all.astype(np.float64)]
+        )
+        mean = pts.mean(axis=0)
+        centered = pts - mean
+        # 显式计算2x2协方差，避开Jetson旧OpenBLAS的小矩阵卡死问题。
+        cxv = centered[:, 0]
+        cyv = centered[:, 1]
+        den = float(max(len(pts) - 1, 1))
+        cov_xy = float(np.sum(cxv * cyv, dtype=np.float64)) / den
+        cov = np.array([
+            [float(np.sum(cxv * cxv, dtype=np.float64)) / den, cov_xy],
+            [cov_xy, float(np.sum(cyv * cyv, dtype=np.float64)) / den],
+        ], dtype=np.float64)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        # 最大特征值方向 = 长轴
+        lu = eigvecs[:, int(np.argmax(eigvals))]
+        lu = lu / (np.linalg.norm(lu) + 1e-9)
+        # 朝下
+        if lu[1] < 0:
+            lu = -lu
+        # 短轴（垂直）
+        su = np.array([-lu[1], lu[0]], dtype=np.float64)
+
+        proj = cxv * lu[0] + cyv * lu[1]
+        t_min, t_max = float(proj.min()), float(proj.max())
+        long = t_max - t_min
+        # 短轴跨度估宽
+        proj_s = cxv * su[0] + cyv * su[1]
+        short = float(proj_s.max() - proj_s.min())
+        if long < 14 or short < 3:
+            return None
+
+        ang_v = float(np.degrees(np.arctan2(lu[0], max(abs(lu[1]), 1e-6))))
+        # 近端优先：只在靠近相机的 70% 长轴上采样（t 大的一端 = 朝下）
+        # lu 朝下时 t_max 端更近
+        t0 = t_min + 0.08 * long
+        t1 = t_max - 0.02 * long
+        n = max(12, min(20, int(long / 10.0)))
+        span = min(0.65 * short + 8.0, 70.0)
+        step_s = max(1.0, span / 12.0)
+        s_grid = np.arange(-span, span + 1e-6, step_s, dtype=np.float64)
+        true_w_cap = min(max(short * 1.15, 20.0), min(100.0, w * 0.55))
+
+        lefts, rights, ys, widths, mids = [], [], [], [], []
+        prev_mid = None
+        for i in range(n):
+            t = t0 + (t1 - t0) * (i / max(n - 1, 1))
+            mx = float(mean[0] + lu[0] * t)
+            my = float(mean[1] + lu[1] * t)
+            xs = np.rint(mx + su[0] * s_grid).astype(np.int32)
+            ys_i = np.rint(my + su[1] * s_grid).astype(np.int32)
+            valid = (xs >= 0) & (xs < w) & (ys_i >= 0) & (ys_i < h)
+            if not np.any(valid):
+                continue
+            on = np.zeros(s_grid.shape[0], dtype=bool)
+            on[valid] = m[ys_i[valid], xs[valid]] > 0
+            if int(on.sum()) < 3:
+                continue
+            hit_s = s_grid[on]
+            s0, s1 = float(hit_s.min()), float(hit_s.max())
+            ww = s1 - s0
+            if ww < 3.0 or ww > true_w_cap:
+                continue
+
+            # 严格取短轴截面两端的几何中点，保证线位于两边界正中。
+            mid_x = mx + su[0] * 0.5 * (s0 + s1)
+            mid_y = my + su[1] * 0.5 * (s0 + s1)
+
+            if prev_mid is not None and abs(mid_x - prev_mid) > max(20.0, short * 0.9):
+                continue
+
+            hw = 0.5 * ww
+            lx = mid_x + su[0] * (-hw)
+            rx = mid_x + su[0] * hw
+            lefts.append(float(min(lx, rx)))
+            rights.append(float(max(lx, rx)))
+            ys.append(float(mid_y))
+            widths.append(float(ww))
+            mids.append(float(mid_x))
+            prev_mid = mid_x
+
+        if len(ys) < 6:
+            return None
+
+        lefts = np.asarray(lefts, dtype=np.float64)
+        rights = np.asarray(rights, dtype=np.float64)
+        ys = np.asarray(ys, dtype=np.float64)
+        widths = np.asarray(widths, dtype=np.float64)
+        mids = np.asarray(mids, dtype=np.float64)
+
+        med_w = float(np.median(widths))
+        keep = (widths >= med_w * 0.4) & (widths <= med_w * 1.8)
+        if int(keep.sum()) >= 6:
+            lefts, rights, ys, widths, mids = (
+                lefts[keep], rights[keep], ys[keep], widths[keep], mids[keep],
+            )
+
+        # 用稳定半宽重绘边，视觉更直；中点保持左右边界的几何中点
+        if len(mids) >= 5:
+            med_w = float(np.median(widths))
+            half = 0.5 * med_w
+            lefts = mids - half
+            rights = mids + half
+            widths[:] = med_w
+
+        if len(mids) >= 5:
+            pts_xy = np.column_stack([mids, ys]).astype(np.float32)
+            line = cv2.fitLine(pts_xy, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+            angle_deg = TroughDetector._angle_vs_vertical(float(line[0]), float(line[1]))
+        else:
+            angle_deg = ang_v
+        return lefts, rights, ys, widths, mids, angle_deg
+
+    @staticmethod
+    def _angle_vs_vertical(vx: float, vy: float) -> float:
+        """长轴相对图像竖直方向的角度，归一到 [-90, 90]。"""
+        # 统一朝下，避免 fitLine 反向得到 ~170° 被门控杀掉
+        if vy < 0:
+            vx, vy = -vx, -vy
+        ang = float(np.degrees(np.arctan2(vx, max(abs(vy), 1e-6))))
+        if ang > 90.0:
+            ang -= 180.0
+        elif ang < -90.0:
+            ang += 180.0
+        return ang
+
+    @staticmethod
+    def _letterbox(im: np.ndarray, new_shape: int = 480, color=(114, 114, 114)):
+        """保持比例缩放 + 灰边填充，返回 (img, ratio, (dw, dh))。"""
+        h, w = im.shape[:2]
+        r = min(new_shape / h, new_shape / w)
+        nw, nh = int(round(w * r)), int(round(h * r))
+        dw, dh = (new_shape - nw) / 2.0, (new_shape - nh) / 2.0
+        if (w, h) != (nw, nh):
+            im = cv2.resize(im, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        im = cv2.copyMakeBorder(
+            im, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color
+        )
+        return im, r, (left, top)
+
+    def _rknn_postproc(
+        self,
+        det_out,
+        proto_out,
+        orig_shape,
+        imgsz,
+        conf_th,
+        ratio=1.0,
+        dw=0.0,
+        dh=0.0,
+        frame_bgr=None,
+    ):
+        """
+        RKNN YOLO11-seg 后处理 (对齐离线 GutterSegInfer):
+          det  (1, 37, N) = xywh + cls + 32 mask coeffs
+          proto(1, 32, mh, mw)
+        """
+        h, w = orig_shape
+        d = det_out[0]  # (37, N)
+        p = proto_out[0]  # (32, mh, mw)
+        if d.ndim != 2 or p.ndim != 3:
+            return None
+
+        scores = d[4].astype(np.float32)
+        yc = self.config.yolo
+        # RKNN 原始分数偏低；Jetson 可用独立阈值，避免共用硬编码
+        thr = min(
+            float(conf_th),
+            float(getattr(yc, "candidate_conf", 0.05)),
+        )
+        cand = np.where(scores >= thr)[0]
+        if cand.size == 0:
+            best = int(np.argmax(scores))
+            if float(scores[best]) < float(getattr(yc, "fallback_conf", 0.02)):
+                self._last_seg_score = float(scores[best])
+                return None
+            cand = np.array([best], dtype=np.int32)
+
+        best_i = None
+        best_rank = -1e9
+        track_cx = self._track_cx
+        track_cy = self._track_cy
+        for i in cand.tolist():
+            score = float(scores[i])
+            cx, cy, bw, bh = map(float, d[0:4, i])
+            if bw < 4 or bh < 4:
+                continue
+            elong = max(bw, bh) / max(min(bw, bh), 1.0)
+            area_frac = (bw * bh) / float(imgsz * imgsz)
+            if area_frac > 0.90 or area_frac < 0.005:
+                continue
+            # 候选排序：弱化中心偏好，避免槽在左/右半边时真槽被丢掉
+            # 竖长条形态优先；跟踪连续性保留，但不要强锁中心假阳性
+            rank = score * (40.0 + min(elong, 12.0) * 12.0)
+            if elong < 1.35:
+                rank *= 0.55
+            if bh >= bw * 1.15:
+                rank *= 1.22
+            # 几乎取消中心扣分（原先 0.0015 会系统性伤害侧向入画）
+            rank -= 0.0002 * abs(cx - imgsz * 0.5)
+            rank -= 0.0004 * abs(cy - imgsz * 0.5)
+            # 侧向大偏移时略奖励（鼓励保住偏左/偏右真槽）
+            side = abs(cx - imgsz * 0.5) / max(imgsz * 0.5, 1.0)
+            if side > 0.25 and bh >= bw:
+                rank *= 1.08
+            # 时间锁定适度减弱，避免锁死后跟丢侧向真槽
+            if track_cx is not None and track_cy is not None:
+                dist = abs(cx - track_cx) + 0.6 * abs(cy - track_cy)
+                rank += max(0.0, 10.0 - 0.055 * dist)
+            if rank > best_rank:
+                best_rank = rank
+                best_i = i
+
+        if best_i is None:
+            best_i = int(cand[int(np.argmax(scores[cand]))])
+
+        score = float(scores[best_i])
+        self._last_seg_score = score
+        cx, cy, bw, bh = map(float, d[0:4, best_i])
+        self._track_cx = cx
+        self._track_cy = cy
+
+        x1 = int(max(0, min(w - 1, (cx - bw * 0.5 - dw) / max(ratio, 1e-6))))
+        y1 = int(max(0, min(h - 1, (cy - bh * 0.5 - dh) / max(ratio, 1e-6))))
+        x2 = int(max(0, min(w - 1, (cx + bw * 0.5 - dw) / max(ratio, 1e-6))))
+        y2 = int(max(0, min(h - 1, (cy + bh * 0.5 - dh) / max(ratio, 1e-6))))
+        if x2 - x1 < 8 or y2 - y1 < 8:
+            return None
+
+        coeffs = d[5:37, best_i].astype(np.float32)
+        mh, mw = int(p.shape[1]), int(p.shape[2])
+        p32 = p.astype(np.float32, copy=False).reshape(32, -1)
+        # Jetson自带的旧OpenBLAS会在这个很小的矩阵乘法上偶发多线程卡死。
+        # 逐元素乘加规模仅32x6400，单线程NumPy更快且延迟稳定。
+        raw = np.sum(
+            p32 * coeffs.reshape(32, 1), axis=0, dtype=np.float32
+        ).reshape(mh, mw)
+        proto_mask = 1.0 / (1.0 + np.exp(-np.clip(raw, -20, 20)))
+
+        gx1 = int(max(0, (cx - bw * 0.5) / imgsz * mw))
+        gy1 = int(max(0, (cy - bh * 0.5) / imgsz * mh))
+        gx2 = int(min(mw, (cx + bw * 0.5) / imgsz * mw))
+        gy2 = int(min(mh, (cy + bh * 0.5) / imgsz * mh))
+        if gx2 > gx1 and gy2 > gy1:
+            keep_p = np.zeros_like(proto_mask)
+            keep_p[gy1:gy2, gx1:gx2] = 1.0
+            proto_mask = proto_mask * keep_p
+
+        mask_lb = cv2.resize(proto_mask, (imgsz, imgsz), interpolation=cv2.INTER_LINEAR)
+        nh = int(round(h * ratio))
+        nw = int(round(w * ratio))
+        y0b = int(round(dh))
+        x0b = int(round(dw))
+        crop = mask_lb[y0b : y0b + nh, x0b : x0b + nw]
+        if crop.size == 0:
+            return None
+
+        # 半分辨率 mask：后处理更快，中心线坐标再乘回
+        out_w, out_h = (w + 1) // 2, (h + 1) // 2
+        self._mask_scale_x = float(w) / float(max(out_w, 1))
+        self._mask_scale_y = float(h) / float(max(out_h, 1))
+        mask_f = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+        mask_thr = (
+            float(getattr(yc, "mask_threshold_low", 0.32))
+            if float(score) < 0.08
+            else float(getattr(yc, "mask_threshold_high", 0.40))
+        )
+        mask = (mask_f > mask_thr).astype(np.uint8) * 255
+
+        pad = 8
+        sx = out_w / float(w)
+        sy = out_h / float(h)
+        x1s = int(x1 * sx)
+        y1s = int(y1 * sy)
+        x2s = int(x2 * sx)
+        y2s = int(y2 * sy)
+        keep = np.zeros_like(mask)
+        keep[
+            max(0, y1s - pad) : min(out_h, y2s + pad),
+            max(0, x1s - pad) : min(out_w, x2s + pad),
+        ] = 255
+        mask = cv2.bitwise_and(mask, keep)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), 1)
+        # TensorRT/PT 对齐：分割只覆盖近端时，沿白色槽体长轴补全远端。
+        # 仅对明显短 mask 启用，且在半分辨率上运行，避免把背景白线扩进去。
+        if bool(getattr(yc, "extend_mask", False)) and frame_bgr is not None:
+            ys_nz, xs_nz = np.where(mask > 0)
+            if xs_nz.size >= 80:
+                span_x = int(xs_nz.max() - xs_nz.min() + 1)
+                span_y = int(ys_nz.max() - ys_nz.min() + 1)
+                span = max(span_x, span_y)
+                short_span = min(span_x, span_y)
+                if (span < int(0.58 * max(out_w, out_h))
+                        and short_span < int(0.30 * min(out_w, out_h))):
+                    frame_small = cv2.resize(
+                        frame_bgr, (out_w, out_h), interpolation=cv2.INTER_AREA
+                    )
+                    mask = extend_mask_along_trough(
+                        frame_small, mask, max_extend_frac=0.40
+                    )
+        nz = int(cv2.countNonZero(mask))
+        return mask if nz > 60 else None
+
+    # ═══════════════════════════════════════════════════════════
+    # HSV传统检测 (YOLO禁用时使用)
+    # ═══════════════════════════════════════════════════════════
+
+    def _detect_trough_white(self, warped_gray: np.ndarray,
+                              warped_color: np.ndarray) -> CenterLineResult:
+        """
+        逐行亮度峰值追踪 + 直线拟合。
+        在每行找最亮位置，所有行的亮点连成线 = 水槽中心线。
+        水槽倾斜时也能准确追踪。
+        """
+        h, w = warped_gray.shape[:2]
+        result = CenterLineResult()
+        frame_center_x = w / 2.0
+
+        # 1. 高斯模糊降噪
+        blurred = cv2.GaussianBlur(warped_gray, (5, 5), 1.0)
+        est_w = self._estimate_trough_width_px(w)
+        half_search = max(int(est_w * 1.5), 15)  # 搜索窗口
+
+        # 2. 逐行找亮度峰值
+        row_peaks = []  # (y, peak_x, width_estimate)
+        for row in range(h // 5, 4 * h // 5, 2):  # 中间60%的行
+            row_data = blurred[row, :].astype(np.float64)
+
+            # 初始估计: 用上一帧中心位置 ± 搜索窗
+            if self._last_center_x is not None:
+                search_cx = int(self._last_center_x)
+            else:
+                search_cx = int(frame_center_x)
+
+            lo = max(5, search_cx - half_search)
+            hi = min(w - 5, search_cx + half_search)
+            if hi <= lo:
+                continue
+
+            # 在搜索窗内找峰值
+            peak_x = lo + int(np.argmax(row_data[lo:hi]))
+            peak_val = float(row_data[peak_x])
+
+            # 找半高宽 → 估算水槽宽度
+            half_val = peak_val * 0.5
+            left_edge = peak_x
+            for x in range(peak_x, max(0, peak_x - half_search), -1):
+                if row_data[x] <= half_val:
+                    left_edge = x
+                    break
+            right_edge = peak_x
+            for x in range(peak_x, min(w, peak_x + half_search)):
+                if row_data[x] <= half_val:
+                    right_edge = x
+                    break
+            row_width = right_edge - left_edge
+
+            # 宽度过滤
+            if row_width > est_w * 0.3 and row_width < est_w * 4.0:
+                row_peaks.append((float(row), float(peak_x), float(row_width)))
+
+        if len(row_peaks) < 5:
+            return self._detect_trough_brightness(warped_gray)
+
+        # 3. RANSAC-like: 中值+内点过滤
+        pxs = np.array([r[1] for r in row_peaks])
+        median_px = np.median(pxs)
+        mad = np.median(np.abs(pxs - median_px))
+        if mad < 1:
+            mad = 1
+        inliers = [r for r in row_peaks if abs(r[1] - median_px) < 2.5 * mad]
+
+        if len(inliers) < 5:
+            return self._detect_trough_brightness(warped_gray)
+
+        # 4. 直线拟合: cx = m * y + b
+        ys = np.array([r[0] for r in inliers])
+        cxs_arr = np.array([r[1] for r in inliers])
+        if len(ys) > 2:
+            A = np.vstack([ys, np.ones(len(ys))]).T
+            m, b = np.linalg.lstsq(A, cxs_arr, rcond=None)[0]
+            angle_rad = np.arctan(m)
+        else:
+            m, b = 0.0, float(cxs_arr.mean())
+            angle_rad = 0.0
+
+        # 5. 中心位置和偏移
+        mid_y = h / 2.0
+        center_x = m * mid_y + b
+        offset_px = center_x - frame_center_x
+
+        # 6. 平均宽度
+        avg_width = np.mean([r[2] for r in inliers])
+
+        # 7. 时间一致性限幅
+        if self._last_center_x is not None:
+            jump = abs(center_x - self._last_center_x)
+            if jump > w * 0.15:
+                d = 1 if center_x > self._last_center_x else -1
+                center_x = self._last_center_x + d * w * 0.15
+                offset_px = center_x - frame_center_x
+
+        # 8. 生成左右边界点 (沿拟合线方向)
+        half_w = avg_width / 2.0
+        left_pts = []
+        right_pts = []
+        for row in range(0, h, max(1, h // 30)):
+            cx_row = m * row + b
+            left_pts.append((cx_row - half_w, float(row)))
+            right_pts.append((cx_row + half_w, float(row)))
+
+        result.left_points = left_pts
+        result.right_points = right_pts
+        result.raw_lines = []
+
+        result.detected = True
+        result.offset_px = offset_px
+        result.angle_rad = angle_rad
+        result.angle_deg = np.degrees(angle_rad)
+        result.trough_width_px = avg_width
+        self._last_center_x = center_x
+        return result
+
+    def _detect_trough_brightness(self, warped_gray: np.ndarray) -> CenterLineResult:
+        """回退方案: 亮度峰值检测 (白色检测不可用时)"""
+        h, w = warped_gray.shape[:2]
+        result = CenterLineResult()
+        frame_center_x = w / 2.0
+
+        col_mean = warped_gray.mean(axis=0).astype(np.float64)
+        sw = max(5, w // 30)
+        col_s = np.convolve(col_mean, np.ones(sw) / sw, mode='same')
+
+        lo, hi = int(w * 0.1), int(w * 0.9)
+        peak_x = lo + int(np.argmax(col_s[lo:hi]))
+        peak_val = float(col_s[peak_x])
+        baseline = float(np.percentile(col_s[lo:hi], 10))
+        threshold = baseline + (peak_val - baseline) * 0.3
+
+        left_x = float(peak_x)
+        for x in range(peak_x, max(0, peak_x - w // 3), -1):
+            if col_s[x] <= threshold:
+                left_x = float(x)
+                break
+        right_x = float(peak_x)
+        for x in range(peak_x, min(w, peak_x + w // 3)):
+            if col_s[x] <= threshold:
+                right_x = float(x)
+                break
+
+        return self._build_result(left_x, right_x, h, w, frame_center_x, warped_gray)
+
+    def _build_result(self, left_x: float, right_x: float,
+                       h: int, w: int, frame_center_x: float,
+                       warped_gray: np.ndarray) -> CenterLineResult:
+        """从左右边界构建检测结果"""
+        result = CenterLineResult()
+        center_x = (left_x + right_x) / 2.0
+
+        # 时间一致性限幅
+        if self._last_center_x is not None:
+            jump = abs(center_x - self._last_center_x)
+            if jump > w * 0.15:
+                d = 1 if center_x > self._last_center_x else -1
+                center_x = self._last_center_x + d * w * 0.15
+                half_w = (right_x - left_x) / 2.0
+                left_x = center_x - half_w
+                right_x = center_x + half_w
+
+        offset_px = center_x - frame_center_x
+
+        # 角度
+        angle_rad = 0.0
+        try:
+            top_half = warped_gray[0:h//2, :].mean(axis=0)
+            bot_half = warped_gray[h//2:h, :].mean(axis=0)
+            s, e = max(0, int(left_x) - 10), min(w, int(right_x) + 11)
+            tp = s + np.argmax(top_half[s:e])
+            bp = s + np.argmax(bot_half[s:e])
+            angle_rad = np.arctan2(float(bp - tp), float(h / 2.0))
+        except:
+            pass
+
+        # 可视化
+        step = max(1, h // 20)
+        result.left_points = [(float(left_x), float(y)) for y in range(0, h, step)]
+        result.right_points = [(float(right_x), float(y)) for y in range(0, h, step)]
+        result.raw_lines = [
+            np.array([[int(left_x), 0, int(left_x), h]]),
+            np.array([[int(right_x), 0, int(right_x), h]]),
+        ]
+
+        result.detected = True
+        result.offset_px = offset_px
+        result.angle_rad = angle_rad
+        result.angle_deg = np.degrees(angle_rad)
+        result.trough_width_px = right_x - left_x
+        self._last_center_x = center_x
+        return result
+
+    def _detect_trough_edges(self, warped: np.ndarray) -> CenterLineResult:
+        """
+        亮度列投影 + 峰值检测找白色PVC水槽。
+
+        PVC水槽是白色/浅色管 → 鸟瞰图中为明亮竖条。
+        列均值投影在槽位形成"山峰"，峰的半高宽 = 水槽像素宽。
+        """
+        h, w = warped.shape[:2]
+        result = CenterLineResult()
+        frame_center_x = w / 2.0
+
+        # 1. 列均值投影
+        col_mean = warped.mean(axis=0).astype(np.float64)
+
+        # 2. 平滑
+        sw = max(5, w // 30)
+        kernel = np.ones(sw) / sw
+        col_s = np.convolve(col_mean, kernel, mode='same')
+
+        # 3. 搜索范围 (中间80%)
+        lo, hi = int(w * 0.1), int(w * 0.9)
+        if hi <= lo:
+            lo, hi = 0, w
+
+        # 4. 找最亮列 = 水槽中心
+        peak_x = lo + int(np.argmax(col_s[lo:hi]))
+        peak_val = float(col_s[peak_x])
+
+        # 5. 找两侧下降到峰值30%的位置 = 边界
+        baseline = float(np.percentile(col_s[lo:hi], 10))
+        threshold = baseline + (peak_val - baseline) * 0.3
+
+        left_x = float(peak_x)
+        for x in range(peak_x, max(0, peak_x - w // 3), -1):
+            if col_s[x] <= threshold:
+                left_x = float(x)
+                break
+
+        right_x = float(peak_x)
+        for x in range(peak_x, min(w, peak_x + w // 3)):
+            if col_s[x] <= threshold:
+                right_x = float(x)
+                break
+
+        # 6. 验证宽度
+        actual_w = right_x - left_x
+        est_w = self._estimate_trough_width_px(w)
+        if actual_w < est_w * 0.2 or actual_w > est_w * 5.0:
+            cx = self._last_center_x if self._last_center_x is not None else frame_center_x
+            left_x = cx - est_w / 2.0
+            right_x = cx + est_w / 2.0
+
+        # 7. 时间一致性限幅
+        center_x = (left_x + right_x) / 2.0
+        if self._last_center_x is not None:
+            jump = abs(center_x - self._last_center_x)
+            if jump > w * 0.12:
+                d = 1 if center_x > self._last_center_x else -1
+                center_x = self._last_center_x + d * w * 0.12
+                left_x = center_x - (right_x - left_x) / 2.0
+                right_x = center_x + (right_x - left_x) / 2.0
+
+        offset_px = center_x - frame_center_x
+
+        # 8. 角度 (上下半部分峰值偏移)
+        angle_rad = 0.0
+        try:
+            top_half = warped[0:h//2, :].mean(axis=0)
+            bot_half = warped[h//2:h, :].mean(axis=0)
+            s = max(0, int(left_x) - 8)
+            e = min(w, int(right_x) + 9)
+            tp = s + np.argmax(top_half[s:e])
+            bp = s + np.argmax(bot_half[s:e])
+            angle_rad = np.arctan2(float(bp - tp), float(h / 2.0))
+        except:
+            pass
+
+        # 9. 可视化数据
+        step = max(1, h // 20)
+        result.left_points = [(float(left_x), float(y)) for y in range(0, h, step)]
+        result.right_points = [(float(right_x), float(y)) for y in range(0, h, step)]
+        result.raw_lines = [
+            np.array([[int(left_x), 0, int(left_x), h]]),
+            np.array([[int(right_x), 0, int(right_x), h]]),
+        ]
+
+        result.detected = True
+        result.offset_px = offset_px
+        result.angle_rad = angle_rad
+        result.angle_deg = np.degrees(angle_rad)
+        result.trough_width_px = right_x - left_x
+        self._last_center_x = center_x
+        return result
+
+    def _estimate_trough_width_px(self, img_w: int) -> float:
+        """估算水槽在鸟瞰图中的像素宽度"""
+        tc = self.config.trough
+        if tc.mm_per_pixel > 0:
+            return tc.trough_width_mm / tc.mm_per_pixel
+        else:
+            return img_w * tc.trough_width_ratio
+
+    def _px_to_mm(self, px: float, trough_width_px: float = 0.0) -> float:
+        """像素偏移 → 毫米偏移"""
+        tc = self.config.trough
+        if tc.mm_per_pixel > 0:
+            return px * tc.mm_per_pixel
+        if trough_width_px and trough_width_px > 10.0:
+            # 用同一控制区域测得的槽宽自标定比例，自动适应高度变化。
+            mm_per_px = tc.trough_width_mm / float(trough_width_px)
+            return px * float(np.clip(mm_per_px, 0.2, 4.0))
+        return px * 0.5
+
+    # ═══════════════════════════════════════════════════════════
+    # 步骤8: EMA时序平滑
+    # ═══════════════════════════════════════════════════════════
+
+    def _temporal_smooth(self, result: CenterLineResult) -> CenterLineResult:
+        """中值滤波 + EMA时序平滑，减少检测抖动"""
+        if result.detected:
+            # 步骤1: 中值滤波 — 把当前原始值加入缓冲区，取中位数
+            self._offset_history.append(result.offset_px)
+            if len(self._offset_history) > self._history_max:
+                self._offset_history.pop(0)
+            # 取中位数作为"去噪后的测量值"
+            filtered_offset = float(np.median(self._offset_history))
+            filtered_angle = result.angle_rad  # 角度暂不做中值滤波
+
+            # 步骤2: EMA平滑；晃动/大偏差时几乎直通，避免线拖在槽外
+            if self._ema_offset is None:
+                self._ema_offset = filtered_offset
+                self._ema_angle = filtered_angle
+            else:
+                alpha = self._ema_alpha
+                d_off = abs(filtered_offset - self._ema_offset)
+                d_ang = abs(filtered_angle - (self._ema_angle or 0.0))
+                if d_off > 18.0:
+                    alpha = min(0.85, alpha + 0.35)
+                elif d_off > 10.0:
+                    alpha = min(0.7, alpha + 0.2)
+                if d_ang > np.radians(6.0):
+                    alpha = min(0.85, alpha + 0.25)
+                prev_ema = self._ema_offset
+                self._ema_offset = alpha * filtered_offset + (1 - alpha) * self._ema_offset
+                self._ema_angle = alpha * filtered_angle + (1 - alpha) * self._ema_angle
+
+                # 瞬移钳制(2026-08-13 试飞后加)：影子误检会让中心线瞬移，
+                # 单帧移动超过物理极限即截断，控制器不再追幽灵线。
+                # 真实极限≈横移80mm/s+偏航0.09rad/s×2m≈9mm/帧，取15mm/帧≈1.7倍余量
+                if result.trough_width_px and result.trough_width_px > 10.0:
+                    mm_per_px = float(np.clip(
+                        self.config.trough.trough_width_mm / float(result.trough_width_px),
+                        0.2, 4.0))
+                    max_dpx = 60.0 / mm_per_px
+                    d = self._ema_offset - prev_ema
+                    if d > max_dpx:
+                        self._ema_offset = prev_ema + max_dpx
+                    elif d < -max_dpx:
+                        self._ema_offset = prev_ema - max_dpx
+
+            result.offset_px = self._ema_offset
+            result.angle_rad = self._ema_angle
+            result.angle_deg = np.degrees(self._ema_angle)
+            result.offset_mm = self._px_to_mm(
+                result.offset_px, result.trough_width_px
+            )
+
+        return result
+
+    # ═══════════════════════════════════════════════════════════
+    # 置信度计算
+    # ═══════════════════════════════════════════════════════════
+
+    def _calc_confidence(self, result: CenterLineResult) -> float:
+        """计算检测置信度 (0-1)"""
+        if not result.detected:
+            return 0.0
+
+        conf = 1.0
+
+        # 因素1: 左右边界点数量 (越多越好)
+        total_pts = len(result.left_points) + len(result.right_points)
+        if total_pts < 20:
+            conf *= total_pts / 20.0
+
+        # 因素2: 宽度合理性
+        # (宽度检查已在_fit_center_line中做了，这里只是加分)
+        # 因素3: 左右平衡 (两边检测到最好)
+        if len(result.left_points) < 3:
+            conf *= 0.7
+        if len(result.right_points) < 3:
+            conf *= 0.7
+
+        # 因素4: 连续检测帧数
+        if self.detect_count > 10:
+            conf = min(1.0, conf * 1.1)  # 连续检测到，提高置信度
+
+        return min(1.0, conf)
+
+    # ═══════════════════════════════════════════════════════════
+    # 简化1D卡尔曼滤波 (用于更高级的平滑)
+    # ═══════════════════════════════════════════════════════════
+
+    def _init_simple_kalman(self):
+        """初始化简化卡尔曼滤波器"""
+        # state: [position, velocity]
+        kalman = cv2.KalmanFilter(2, 1, 0)
+        kalman.transitionMatrix = np.array([[1., 1.], [0., 1.]], dtype=np.float32)
+        kalman.measurementMatrix = np.array([[1., 0.]], dtype=np.float32)
+        kalman.processNoiseCov = np.array([[1., 0.], [0., 3.]], dtype=np.float32) * 0.03
+        kalman.measurementNoiseCov = np.array([[1.]], dtype=np.float32) * 10.0
+        kalman.errorCovPost = np.eye(2, dtype=np.float32) * 100.0
+        return kalman
+
+    def _kalman_filter(self, measurement: float) -> float:
+        """卡尔曼滤波一步更新"""
+        self._kalman.correct(np.array([[measurement]], dtype=np.float32))
+        prediction = self._kalman.predict()
+        return float(prediction[0])

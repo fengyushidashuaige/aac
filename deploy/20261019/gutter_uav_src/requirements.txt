@@ -1,0 +1,15 @@
+# PVC水槽中心线检测 - 依赖
+# AIO 3588L (RK3588) 平台
+
+# 核心
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# 飞控通信 (ArduPilot / PX4)
+pymavlink>=2.4.0
+
+# 可选: 串口通信 (RC override / 数传)
+pyserial>=3.5
+
+# 可选: 配置文件解析
+pyyaml>=6.0
